@@ -165,8 +165,7 @@ int find_split(const std::vector<T> &cuts, T v)
 class BasicTest : public TestInterface {
 public:
   // graph config parameters
-  int num_nodes = 0;
-  int num_edges = 0;
+  int num_nodes = 1000;
   int num_pieces = 4;
   std::string filename;
 
