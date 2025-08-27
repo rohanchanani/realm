@@ -504,7 +504,7 @@ public:
                                                   p_garbage_nodes,
                                                   Realm::ProfilingRequestSet());
         if (wait_on_events) e01.wait();
-    Event e02 = is_edges.create_subspaces_by_preimage(dst_node_field_data,
+    Event e02 = is_edges.create_subspaces_by_preimage(dst_field_data_gpu,
                                                      p_garbage_nodes,
                                                      p_garbage_edges,
                                                      Realm::ProfilingRequestSet(),
@@ -520,7 +520,7 @@ public:
                                                   e02);
     if(wait_on_events) e03.wait();
 
-    Event e04 = is_edges.create_subspaces_by_preimage(dst_node_field_data,
+    Event e04 = is_edges.create_subspaces_by_preimage(dst_field_data_gpu,
                                                   p_garbage_rd,
                                                   p_garbage_preimage_edges,
                                                   Realm::ProfilingRequestSet(),
@@ -537,7 +537,7 @@ public:
   	log_app.info() << "GPU By Field complete " << Clock::current_time_in_microseconds() << "\n";
   	log_app.info() << "Starting GPU Preimage " << Clock::current_time_in_microseconds() << "\n";
     // now compute p_edges based on the color of their in_node (i.e. a preimage)
-    Event e2 = is_edges.create_subspaces_by_preimage(dst_node_field_data,
+    Event e2 = is_edges.create_subspaces_by_preimage(dst_field_data_gpu,
 						     p_nodes,
 						     p_edges,
 						     Realm::ProfilingRequestSet(),
@@ -557,7 +557,7 @@ public:
   	log_app.info() << "GPU Image complete " << Clock::current_time_in_microseconds() << "\n";
   	log_app.info() << "Starting second GPU preimage " << Clock::current_time_in_microseconds() << "\n";
 
-    Event e4 = is_edges.create_subspaces_by_preimage(dst_node_field_data,
+    Event e4 = is_edges.create_subspaces_by_preimage(dst_field_data_gpu,
 						  p_rd,
 						  p_preimage_edges,
 						  Realm::ProfilingRequestSet(),

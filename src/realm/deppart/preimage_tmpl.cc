@@ -45,6 +45,7 @@ namespace Realm {
 
 #define DOIT(T1,T2)			    \
   template class PreimageMicroOp<N1,T1,N2,T2>; \
+  template class GPUPreimageMicroOp<N1,T1,N2,T2>; \
   template class StructuredPreimageMicroOp<N1,T1,N2,T2>; \
   template class PreimageOperation<N1,T1,N2,T2>; \
   template PreimageMicroOp<N1,T1,N2,T2>::PreimageMicroOp(NodeID, AsyncMicroOp *, Serialization::FixedBufferDeserializer&); \
