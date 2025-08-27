@@ -1871,6 +1871,13 @@ namespace Realm {
   template <int N, typename T>
   void DifferenceOperation<N,T>::execute(void)
   {
+
+    const char* val = std::getenv("GPU_DIFFERENCE");  // or any env var
+    if (val) {
+      GPUDifferenceMicroOp<N, T> *uop = new GPUDifferenceMicroOp<N,T>(lhss, rhss, outputs);
+      uop->dispatch(this, true /* ok to run in this thread */);
+      return;
+    }
     for(size_t i = 0; i < outputs.size(); i++) {
       SparsityMapImpl<N,T>::lookup(outputs[i])->set_contributor_count(1);
 
@@ -1951,6 +1958,40 @@ namespace Realm {
     }
   }
 
+  template <int N, typename T>
+  GPUDifferenceMicroOp<N, T>::GPUDifferenceMicroOp(const std::vector<IndexSpace<N,T> > &_lhss, const std::vector<IndexSpace<N,T> > &_rhss, const std::vector<SparsityMap<N,T> > &_sparsity_outputs)
+      : lhss(_lhss), rhss(_rhss), sparsity_outputs(_sparsity_outputs) {}
+
+  template <int N, typename T>
+  GPUDifferenceMicroOp<N, T>::~GPUDifferenceMicroOp() {}
+
+  template <int N, typename T>
+  void GPUDifferenceMicroOp<N, T>::dispatch(
+      PartitioningOperation *op, bool inline_ok) {
+
+    for (size_t i = 0; i < lhss.size(); i++) {
+      if (!lhss[i].dense()) {
+          bool registered = SparsityMapImpl<N, T>::lookup(lhss[i].sparsity)
+                                ->add_waiter(this, true /*precise*/);
+          if (registered) this->wait_count.fetch_add(1);
+      }
+    }
+    for (size_t i = 0; i < rhss.size(); i++) {
+      if (!rhss[i].dense()) {
+        bool registered = SparsityMapImpl<N, T>::lookup(rhss[i].sparsity)
+                              ->add_waiter(this, true /*precise*/);
+        if (registered) this->wait_count.fetch_add(1);
+      }
+    }
+    this->finish_dispatch(op, inline_ok);
+  }
+
+  template <int N, typename T>
+  void GPUDifferenceMicroOp<N, T>::execute(void) {
+    TimeStamp ts("GPUDifferenceMicroOp::execute", true, &log_uop_timing);
+    gpu_populate();
+  }
+
 
 #define DOIT(N,T) \
   template class UnionMicroOp<N,T>; \
@@ -1961,6 +2002,7 @@ namespace Realm {
   template class DifferenceOperation<N,T>; \
   template class GPUUnionMicroOp<N,T>; \
   template class GPUIntersectionMicroOp<N,T>; \
+  template class GPUDifferenceMicroOp<N,T>; \
   template UnionMicroOp<N,T>::UnionMicroOp(NodeID, AsyncMicroOp *, Serialization::FixedBufferDeserializer&); \
   template IntersectionMicroOp<N,T>::IntersectionMicroOp(NodeID, AsyncMicroOp *, Serialization::FixedBufferDeserializer&); \
   template DifferenceMicroOp<N,T>::DifferenceMicroOp(NodeID, AsyncMicroOp *, Serialization::FixedBufferDeserializer&); \

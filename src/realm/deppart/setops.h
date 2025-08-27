@@ -232,6 +232,27 @@ namespace Realm {
     std::vector<SparsityMap<N,T>> sparsity_outputs;
   };
 
+  template <int N, typename T>
+  class GPUDifferenceMicroOp : public GPUMicroOp<N, T> {
+  public:
+    static const int DIM = N;
+    typedef T IDXTYPE;
+
+    GPUDifferenceMicroOp(const std::vector<IndexSpace<N,T> > &_lhss, const std::vector<IndexSpace<N,T> > &_rhss, const std::vector<SparsityMap<N,T> > &_sparsity_outputs);
+
+    virtual ~GPUDifferenceMicroOp(void);
+
+    virtual void execute(void);
+
+    void dispatch(PartitioningOperation *op, bool inline_ok);
+
+  protected:
+    void gpu_populate();
+
+    std::vector<IndexSpace<N,T> > lhss, rhss;
+    std::vector<SparsityMap<N,T>> sparsity_outputs;
+  };
+
 };
 
 #endif // REALM_DEPPART_SETOPS_H
