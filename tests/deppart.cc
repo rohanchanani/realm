@@ -43,7 +43,7 @@ enum
   INIT_CIRCUIT_DATA_TASK,
   INIT_BASIC_DATA_TASK,
   INIT_RANGE_DATA_TASK,
-  INIT_2D_DATA_TASK,
+  INIT_RANGE2D_DATA_TASK,
   INIT_PENNANT_DATA_TASK,
   INIT_MINIAERO_DATA_TASK,
 };
@@ -1165,16 +1165,15 @@ public:
   }
 };
 
-class RangeTest : public TestInterface {
+class Range2DTest : public TestInterface {
 public:
   // graph config parameters
   int num_nodes = 1000;
   int num_rects = 1000;
   int max_rect_size = 10;
   int num_pieces = 4;
-  std::string filename;
 
-  RangeTest(int argc, const char *argv[])
+  Range2DTest(int argc, const char *argv[])
   {
     for(int i = 1; i < argc; i++) {
 
@@ -1183,23 +1182,21 @@ public:
 	continue;
       }
 
-      if(!strcmp(argv[i], "-n")) {
-        num_nodes = atoi(argv[++i]);
-        continue;
-      }
+        if(!strcmp(argv[i], "-n")) {
+          num_nodes = atoi(argv[++i]);
+          continue;
+        }
 
-      if(!strcmp(argv[i], "-r")) {
-        num_rects = atoi(argv[++i]);
-        continue;
-      }
+        if (!strcmp(argv[i], "-r")) {
+          num_rects = atoi(argv[++i]);
+          continue;
+        }
 
-      if(!strcmp(argv[i], "-m")) {
-        max_rect_size = atoi(argv[++i]);
-        continue;
-      }
+        if (!strcmp(argv[i], "-m")) {
+          max_rect_size = atoi(argv[++i]);
+          continue;
+        }
     }
-
-
 
     if (num_nodes <= 0 || num_rects <= 0) {
       log_app.error() << "Invalid graph dimensions in input file: rects=" << num_rects << " nodes=" << num_nodes;
@@ -1236,19 +1233,24 @@ public:
       subgraph = idx * num_pieces / num_nodes;
   }
 
-  void initialize_rect_data(int idx, Rect<1> &rect, int max_rect_size = 10)
+  void initialize_rect_data(int idx, Rect<2> &rect, int max_rect_size = 10)
   {
 
-    int first = Philox_2x32<>::rand_int(random_seed, idx, NODE_SUBGRAPH_STREAM, num_nodes);
-    int amount = Philox_2x32<>::rand_int(random_seed, idx + 1, NODE_SUBGRAPH_STREAM, max_rect_size);
-    rect = Rect<1>(first, first + amount);
+    int x = Philox_2x32<>::rand_int(random_seed, idx, NODE_SUBGRAPH_STREAM, num_nodes);
+    int y = Philox_2x32<>::rand_int(random_seed, idx + 1, NODE_SUBGRAPH_STREAM, num_nodes);
+    int length = Philox_2x32<>::rand_int(random_seed, idx + 2, NODE_SUBGRAPH_STREAM, max_rect_size);
+    int height = Philox_2x32<>::rand_int(random_seed, idx + 3, NODE_SUBGRAPH_STREAM, max_rect_size);
+    rect.lo[0] = x;
+    rect.hi[0] = x + length;
+    rect.lo[1] = y;
+    rect.hi[1] = y + height;
   }
 
 
   static void init_data_task_wrapper(const void *args, size_t arglen,
 				     const void *userdata, size_t userlen, Processor p)
   {
-    RangeTest *me = (RangeTest *)testcfg;
+    Range2DTest *me = (Range2DTest *)testcfg;
     me->init_data_task(args, arglen, p);
   }
 
@@ -1261,7 +1263,7 @@ public:
     i_args.ri_nodes.fetch_metadata(p).wait();
     i_args.ri_rects.fetch_metadata(p).wait();
 
-    IndexSpace<1> is_nodes = i_args.ri_nodes.get_indexspace<1>();
+    IndexSpace<2> is_nodes = i_args.ri_nodes.get_indexspace<2>();
     IndexSpace<1> is_rects = i_args.ri_rects.get_indexspace<1>();
 
     log_app.debug() << "N: " << is_nodes;
@@ -1278,12 +1280,16 @@ public:
       }
     }
     {
-      AffineAccessor<int,1> a_piece_id(i_args.ri_nodes, 0 /* offset */);
+      AffineAccessor<int,2> a_piece_id(i_args.ri_nodes, 0 /* offset */);
 
-      for(int i = is_nodes.bounds.lo; i <= is_nodes.bounds.hi; i++) {
-        int subgraph;
-        random_node_data(i, subgraph);
-        a_piece_id.write(i, subgraph);
+      for(int i = is_nodes.bounds.lo[0]; i <= is_nodes.bounds.hi[0]; i++) {
+        for (int j = is_nodes.bounds.lo[1]; j <= is_nodes.bounds.hi[1]; j++) {
+          int idx = i * (is_nodes.bounds.hi[1] - is_nodes.bounds.lo[1] + 1) + j;
+          //std::cout << "a_piece_id[" << idx << "] = " << a_piece_id.read(idx) << "\n";
+          int subgraph;
+          random_node_data(idx, subgraph);
+          a_piece_id.write(Point<2>(i, j), subgraph);
+        }
       }
     }
 
@@ -1292,44 +1298,49 @@ public:
       //std::cout << "a_in_node = " << a_in_node << "\n";
       //std::cout << "a_out_node = " << a_out_node << "\n";
 
-      AffineAccessor<Rect<1>, 1> a_rect(i_args.ri_rects, 1 * sizeof(int) /* offset */);
+      AffineAccessor<Rect<2>, 1> a_rect(i_args.ri_rects, 1 * sizeof(int) /* offset */);
 
       // Read edges line by line
       for(int i = is_rects.bounds.lo; i <= is_rects.bounds.hi; i++) {
-        Rect<1> rect;
+        Rect<2> rect;
         initialize_rect_data(i, rect, max_rect_size);
         a_rect.write(i, rect);
       }
     }
 
     if(show_graph) {
-      AffineAccessor<int,1> a_piece_id(i_args.ri_nodes, 0 /* offset */);
+      AffineAccessor<int,2> a_piece_id(i_args.ri_nodes, 0 /* offset */);
 
-      for(int i = is_nodes.bounds.lo; i <= is_nodes.bounds.hi; i++)
-	std::cout << "node_id[" << i << "] = " << a_piece_id.read(i) << std::endl;
+      for(int i = is_nodes.bounds.lo[0]; i <= is_nodes.bounds.hi[1]; i++) {
+        for (int j = is_nodes.bounds.lo[1]; j <= is_nodes.bounds.hi[1]; j++) {
+          Point<2> p(i, j);
+          std::cout << "node_id[" << p << "] = " << a_piece_id.read(p) << std::endl;
+        }
+      }
 
       AffineAccessor<int,1> a_rect_id(i_args.ri_rects, 0 * sizeof(Point<1>) /* offset */);
 
       for(int i = is_rects.bounds.lo; i <= is_rects.bounds.hi; i++)
 	std::cout << "rect_id[" << i << "] = " << a_rect_id.read(i) << std::endl;
 
-      AffineAccessor<Rect<1>,1> a_rect_val(i_args.ri_rects, 1 * sizeof(int) /* offset */);
+      AffineAccessor<Rect<2>,1> a_rect_val(i_args.ri_rects, 1 * sizeof(int) /* offset */);
 
       for(int i = is_rects.bounds.lo; i <= is_rects.bounds.hi; i++)
 	std::cout << "rect_val[" << i << "] = " << a_rect_val.read(i) << std::endl;
     }
   }
 
-  IndexSpace<1> is_nodes, is_rects;
+  IndexSpace<1> is_rects;
+  IndexSpace<2> is_nodes;
   std::vector<RegionInstance> ri_nodes;
-  std::vector<FieldDataDescriptor<IndexSpace<1>, int> > node_id_field_data;
+  std::vector<FieldDataDescriptor<IndexSpace<2>, int> > node_id_field_data;
   std::vector<RegionInstance> ri_rects;
   std::vector<FieldDataDescriptor<IndexSpace<1>, int> > rect_id_field_data;
-  std::vector<FieldDataDescriptor<IndexSpace<1>, Rect<1> > > rect_val_field_data;
+  std::vector<FieldDataDescriptor<IndexSpace<1>, Rect<2> > > rect_val_field_data;
 
   virtual void print_info(void)
   {
-    printf("Realm dependent partitioning test - ranges: %d nodes, %d rects, %d pieces\n",
+    printf("Realm dependent partitioning test - 2D ranges: %d nodes, %d rects, %d pieces\n",
 	   (int)num_nodes, (int)num_rects, (int)num_pieces);
   }
 
@@ -1337,11 +1348,11 @@ public:
 				const std::vector<Processor>& procs)
   {
     // now create index spaces for nodes and edges
-    is_nodes = Rect<1>(0, num_nodes - 1);
+    is_nodes = Rect<2>(Point<2>(0, 0), Point<2>(num_nodes - 1, num_nodes - 1));
     is_rects = Rect<1>(0, num_rects - 1);
 
     // equal partition is used to do initial population of edges and nodes
-    std::vector<IndexSpace<1> > ss_nodes_eq;
+    std::vector<IndexSpace<2> > ss_nodes_eq;
     std::vector<IndexSpace<1> > ss_rects_eq;
 
     std::cout << "Creating equal subspaces" << std::endl;
@@ -1349,7 +1360,7 @@ public:
     is_nodes.create_equal_subspaces(num_pieces, 1, ss_nodes_eq, Realm::ProfilingRequestSet()).wait();
     is_rects.create_equal_subspaces(num_pieces, 1, ss_rects_eq, Realm::ProfilingRequestSet()).wait();
 
-    log_app.debug() << "Initial partitions:";
+    log_app.debug() << "Initial partitions:\n";
     for(size_t i = 0; i < ss_nodes_eq.size(); i++)
       log_app.debug() << " Nodes #" << i << ": " << ss_nodes_eq[i];
     for(size_t i = 0; i < ss_rects_eq.size(); i++)
@@ -1359,7 +1370,7 @@ public:
     std::vector<size_t> node_fields, rect_fields;
     node_fields.push_back(sizeof(int));  // piece_id
     rect_fields.push_back(sizeof(int));  // src_node
-    rect_fields.push_back(sizeof(Rect<1>));  // dst_node
+    rect_fields.push_back(sizeof(Rect<2>));  // dst_node
 
     ri_nodes.resize(num_pieces);
     node_id_field_data.resize(num_pieces);
@@ -1410,7 +1421,7 @@ public:
       args.index = i;
       args.ri_nodes = ri_nodes[i];
       args.ri_rects = ri_rects[i];
-      Event e = p.spawn(INIT_RANGE_DATA_TASK, &args, sizeof(args));
+      Event e = p.spawn(INIT_RANGE2D_DATA_TASK, &args, sizeof(args));
       events.insert(e);
     }
 
@@ -1422,8 +1433,13 @@ public:
   //  p_rd, p_wr, p_ghost - subsets of the above split by subckt
   //  p_edges               - subsets of is_edges for each subckt
 
-  std::vector<IndexSpace<1> > p_colored_rects, p_rects;
-  std::vector<IndexSpace<1> > p_colored_rects_cpu, p_rects_cpu;
+  std::vector<IndexSpace<1> > p_colored_rects;
+  std::vector<IndexSpace<2>> p_rects;
+  std::vector<IndexSpace<1>> p_colored_rects_cpu;
+  std::vector<IndexSpace<2>> p_rects_cpu;
+
+  IndexSpace<2> cpu_union;
+  IndexSpace<2> gpu_union, garbage_union;
 
   virtual Event perform_partitioning(void)
   {
@@ -1449,13 +1465,13 @@ public:
     assert(found_gpu_memory);
     std::vector<size_t> rect_fields;
     rect_fields.push_back(sizeof(int));
-    rect_fields.push_back(sizeof(Rect<1>));
+    rect_fields.push_back(sizeof(Rect<2>));
     std::vector<size_t> node_fields;
     node_fields.push_back(sizeof(int));
 
-    std::vector<FieldDataDescriptor<IndexSpace<1>, int > > node_id_data_gpu;
+    std::vector<FieldDataDescriptor<IndexSpace<2>, int > > node_id_data_gpu;
     std::vector<FieldDataDescriptor<IndexSpace<1>, int > > rect_id_data_gpu;
-    std::vector<FieldDataDescriptor<IndexSpace<1>, Rect<1>>> rect_val_data_gpu;
+    std::vector<FieldDataDescriptor<IndexSpace<1>, Rect<2>>> rect_val_data_gpu;
     node_id_data_gpu.resize(num_pieces);
     rect_id_data_gpu.resize(num_pieces);
     rect_val_data_gpu.resize(num_pieces);
@@ -1495,10 +1511,10 @@ public:
       rect_id_cpu_field.size = sizeof(int);
       rect_id_cpu_field.field_id = 0;
       rect_val_gpu_field.inst = rect_val_instance;
-      rect_val_gpu_field.size = sizeof(Rect<1>);
+      rect_val_gpu_field.size = sizeof(Rect<2>);
       rect_val_gpu_field.field_id = sizeof(int);
       rect_val_cpu_field.inst = rect_val_field_data[i].inst;
-      rect_val_cpu_field.size = sizeof(Rect<1>);
+      rect_val_cpu_field.size = sizeof(Rect<2>);
       rect_val_cpu_field.field_id = sizeof(int);
       std::vector<CopySrcDstField> node_id_gpu_data, node_id_cpu_data, rect_id_gpu_data, rect_id_cpu_data, rect_val_gpu_data, rect_val_cpu_data;
       node_id_gpu_data.push_back(node_id_gpu_field);
@@ -1524,7 +1540,11 @@ public:
       rect_val_data_gpu[i].field_offset = sizeof(int);
     }
     wait_on_events = true;
-    std::vector<IndexSpace<1>> p_garbage_rects, p_garbage_colors;
+    std::vector<IndexSpace<1>> p_garbage_colors;
+    std::vector<IndexSpace<2>> p_garbage_rects;
+    setenv("GPU_UNION", "1", 1);
+    setenv("GPU_DIFFERENCE", "1", 1);
+    setenv("GPU_INTERSECTION", "1", 1);
     std::cout << "WARMING UP " << std::endl;
 
     Event e001 = is_rects.create_subspaces_by_field(rect_id_data_gpu,
@@ -1538,6 +1558,28 @@ public:
                                                      Realm::ProfilingRequestSet(),
                                                      e001);
     if(wait_on_events) e002.wait();
+    Event e003 = IndexSpace<2>::compute_union(p_garbage_rects,
+                                              garbage_union,
+                                              Realm::ProfilingRequestSet(),
+                                              e002);
+    if(wait_on_events) e003.wait();
+    std::vector<IndexSpace<2>> p_garbage_rhs(p_garbage_rects);
+    std::vector<IndexSpace<2>> p_garbage_intersect;
+    auto last = p_garbage_rhs.back();
+    p_garbage_rhs.insert(p_garbage_rhs.begin(), last);
+    p_garbage_rhs.pop_back();
+    Event e004 = IndexSpace<2>::compute_intersections(p_garbage_rects,
+                                                  p_garbage_rhs,
+                                                  p_garbage_intersect,
+                                                  Realm::ProfilingRequestSet(),
+                                                  e003);
+    std::vector<IndexSpace<2>> p_garbage_diff;
+    Event e005 = IndexSpace<2>::compute_differences(p_garbage_rects,
+                                                  p_garbage_rhs,
+                                                  p_garbage_diff,
+                                                  Realm::ProfilingRequestSet(),
+                                                  e004);
+    if (wait_on_events) e005.wait();
 
     std::cout << "FINISHED WARMING UP " << std::endl;
     std::cout << "starting GPU  partitioning " << Clock::current_time_in_microseconds() << std::endl;
@@ -1558,8 +1600,41 @@ public:
                                                      Realm::ProfilingRequestSet(),
                                                      e01);
     if(wait_on_events) e02.wait();
-
     std::cout << "FINISHED GPU BY IMAGE " << Clock::current_time_in_microseconds() << std::endl;
+    std::cout << "STARTING GPU UNION" << Clock::current_time_in_microseconds() << std::endl;
+    Event e03 = IndexSpace<2>::compute_union(p_rects,
+                                              gpu_union,
+                                              Realm::ProfilingRequestSet(),
+                                              e02);
+    if(wait_on_events) e03.wait();
+
+    std::cout << "FINISHED GPU UNION " << Clock::current_time_in_microseconds() << std::endl;
+    std::vector<IndexSpace<2>> p_rhs(p_rects);\
+    std::vector<IndexSpace<2>> p_intersect;
+    auto gpu_last = p_rhs.back();
+    p_rhs.insert(p_rhs.begin(), gpu_last);
+    p_rhs.pop_back();
+    std::cout << "STARTING GPU INTERSECTIONS " << Clock::current_time_in_microseconds() << std::endl;
+    Event e04 = IndexSpace<2>::compute_intersections(p_rects,
+                                                  p_rhs,
+                                                  p_intersect,
+                                                  Realm::ProfilingRequestSet(),
+                                                  e03);
+    if (wait_on_events) e04.wait();
+    std::cout << "FINISHED GPU INTERSECTIONS " << Clock::current_time_in_microseconds() << std::endl;
+    std::cout << "STARTING GPU DIFFS " << Clock::current_time_in_microseconds() << std::endl;
+    std::vector<IndexSpace<2>> p_diff;
+    Event e05 = IndexSpace<2>::compute_differences(p_rects,
+                                                  p_rhs,
+                                                  p_diff,
+                                                  Realm::ProfilingRequestSet(),
+                                                  e04);
+    if (wait_on_events) e05.wait();
+    std::cout << "FINISHED GPU DIFFS " << Clock::current_time_in_microseconds() << std::endl;
+    std::cout << "GPU Partitioning complete " << Clock::current_time_in_microseconds() << std::endl;
+    unsetenv("GPU_UNION");
+    unsetenv("GPU_DIFFERENCE");
+    unsetenv("GPU_INTERSECTION");
     std::cout << "STARTING CPU  partitioning " << Clock::current_time_in_microseconds() << std::endl;
     std::cout << "STARTING CPU BY FIELD " << Clock::current_time_in_microseconds() << std::endl;
     Event e1 = is_rects.create_subspaces_by_field(rect_id_field_data,
@@ -1576,6 +1651,36 @@ public:
                                                      e1);
     if(wait_on_events) e2.wait();
     std::cout << "FINISHED CPU BY IMAGE " << Clock::current_time_in_microseconds() << std::endl;
+    std::cout << "STARTING CPU UNION" << Clock::current_time_in_microseconds() << std::endl;
+    Event e3 = IndexSpace<2>::compute_union(p_rects_cpu,
+                                              cpu_union,
+                                              Realm::ProfilingRequestSet(),
+                                              e2);
+    if(wait_on_events) e3.wait();
+
+    std::cout << "FINISHED CPU UNION " << Clock::current_time_in_microseconds() << std::endl;
+    std::vector<IndexSpace<2>> p_rhs_cpu(p_rects_cpu);\
+    std::vector<IndexSpace<2>> p_intersect_cpu;
+    auto cpu_last = p_rhs_cpu.back();
+    p_rhs_cpu.insert(p_rhs_cpu.begin(), cpu_last);
+    p_rhs_cpu.pop_back();
+    std::cout << "STARTING CPU INTERSECTIONS " << Clock::current_time_in_microseconds() << std::endl;
+    Event e4 = IndexSpace<2>::compute_intersections(p_rects_cpu,
+                                                  p_rhs_cpu,
+                                                  p_intersect_cpu,
+                                                  Realm::ProfilingRequestSet(),
+                                                  e3);
+    if (wait_on_events) e4.wait();
+    std::cout << "FINISHED CPU INTERSECTIONS " << Clock::current_time_in_microseconds() << std::endl;
+    std::cout << "STARTING CPU DIFFS " << Clock::current_time_in_microseconds() << std::endl;
+    std::vector<IndexSpace<2>> p_diff_cpu;
+    Event e5 = IndexSpace<2>::compute_differences(p_rects_cpu,
+                                                  p_rhs_cpu,
+                                                  p_diff_cpu,
+                                                  Realm::ProfilingRequestSet(),
+                                                  e4);
+    if (wait_on_events) e5.wait();
+    std::cout << "FINISHED CPU DIFFS " << Clock::current_time_in_microseconds() << std::endl;
     std::cout << "CPU Partitioning complete " << Clock::current_time_in_microseconds() << std::endl;
 
     std::cout << "Checking correctness of partitioning " << std::endl;
@@ -1592,18 +1697,54 @@ public:
           assert(p_colored_rects[i].contains(point.p));
         }
       }
-      for (IndexSpaceIterator<1> it(p_rects[i]); it.valid; it.step()) {
-        for (PointInRectIterator<1> point(it.rect); point.valid; point.step()) {
+      for (IndexSpaceIterator<2> it(p_rects[i]); it.valid; it.step()) {
+        //std::cout << "GPU RECT " << i << " : " << it.rect << std::endl;
+        for (PointInRectIterator<2> point(it.rect); point.valid; point.step()) {
           assert(p_rects_cpu[i].contains(point.p));
         }
       }
-      for (IndexSpaceIterator<1> it(p_rects_cpu[i]); it.valid; it.step()) {
-        for (PointInRectIterator<1> point(it.rect); point.valid; point.step()) {
+      for (IndexSpaceIterator<2> it(p_rects_cpu[i]); it.valid; it.step()) {
+        //std::cout << "CPU RECT " << i << " : " << it.rect << std::endl;
+        for (PointInRectIterator<2> point(it.rect); point.valid; point.step()) {
           assert(p_rects[i].contains(point.p));
+        }
+      }
+      for (IndexSpaceIterator<2> it(p_intersect[i]); it.valid; it.step()) {
+        //std::cout << "GPU RECT " << i << " : " << it.rect << std::endl;
+        for (PointInRectIterator<2> point(it.rect); point.valid; point.step()) {
+          assert(p_intersect_cpu[i].contains(point.p));
+        }
+      }
+      for (IndexSpaceIterator<2> it(p_intersect_cpu[i]); it.valid; it.step()) {
+        //std::cout << "CPU RECT " << i << " : " << it.rect << std::endl;
+        for (PointInRectIterator<2> point(it.rect); point.valid; point.step()) {
+          assert(p_intersect[i].contains(point.p));
+        }
+      }
+      for (IndexSpaceIterator<2> it(p_diff[i]); it.valid; it.step()) {
+        //std::cout << "GPU RECT " << i << " : " << it.rect << std::endl;
+        for (PointInRectIterator<2> point(it.rect); point.valid; point.step()) {
+          assert(p_diff_cpu[i].contains(point.p));
+        }
+      }
+      for (IndexSpaceIterator<2> it(p_diff_cpu[i]); it.valid; it.step()) {
+        //std::cout << "CPU RECT " << i << " : " << it.rect << std::endl;
+        for (PointInRectIterator<2> point(it.rect); point.valid; point.step()) {
+          assert(p_diff[i].contains(point.p));
         }
       }
     }
 
+    for (IndexSpaceIterator<2> it(gpu_union); it.valid; it.step()) {
+      for (PointInRectIterator<2> point(it.rect); point.valid; point.step()) {
+            assert(cpu_union.contains(point.p));
+      }
+    }
+    for (IndexSpaceIterator<2> it(cpu_union); it.valid; it.step()) {
+      for (PointInRectIterator<2> point(it.rect); point.valid; point.step()) {
+            assert(gpu_union.contains(point.p));
+      }
+    }
     std::cout << "Partitioning correctness check passed " << std::endl;
     exit(0);
     return e02;
@@ -4298,6 +4439,11 @@ int main(int argc, char **argv)
       break;
     }
 
+    if (!strcmp(argv[i], "double")) {
+      testcfg = new Range2DTest(argc - i, const_cast<const char **>(argv + i));
+      break;
+    }
+
     if(!strcmp(argv[i], "pennant")) {
       testcfg = new PennantTest(argc - i, const_cast<const char **>(argv + i));
       break;
@@ -4336,6 +4482,7 @@ int main(int argc, char **argv)
   rt.register_task(INIT_PENNANT_DATA_TASK, PennantTest::init_data_task_wrapper);
   rt.register_task(INIT_BASIC_DATA_TASK, BasicTest::init_data_task_wrapper);
   rt.register_task(INIT_RANGE_DATA_TASK, RangeTest::init_data_task_wrapper);
+  rt.register_task(INIT_RANGE2D_DATA_TASK, Range2DTest::init_data_task_wrapper);
   rt.register_task(INIT_MINIAERO_DATA_TASK, MiniAeroTest::init_data_task_wrapper);
 
   signal(SIGALRM, sigalrm_handler);

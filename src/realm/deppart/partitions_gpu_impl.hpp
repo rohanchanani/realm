@@ -1141,7 +1141,7 @@ namespace Realm {
       CUDA_CHECK(cudaStreamSynchronize(stream), stream);
     }
 
-    heads_instance.destroy();
+    break_points_instance.destroy();
     shared_instance.destroy();
     tmp_instance.destroy();
 

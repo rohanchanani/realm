@@ -187,6 +187,28 @@ namespace Realm {
     std::vector<SparsityMap<N,T> > outputs;
   };
 
+  template <int N, typename T>
+  class GPUUnionMicroOp : public GPUMicroOp<N, T> {
+  public:
+    static const int DIM = N;
+    typedef T IDXTYPE;
+
+    GPUUnionMicroOp(const std::vector<std::vector<IndexSpace<N,T> > > &_inputs,
+                    const std::vector<SparsityMap<N,T> > &_sparsity_outputs);
+
+    virtual ~GPUUnionMicroOp(void);
+
+    virtual void execute(void);
+
+    void dispatch(PartitioningOperation *op, bool inline_ok);
+
+  protected:
+    void gpu_populate();
+
+    std::vector<std::vector<IndexSpace<N,T>> > inputs;
+    std::vector<SparsityMap<N,T>> sparsity_outputs;
+  };
+
 };
 
 #endif // REALM_DEPPART_SETOPS_H

@@ -1198,7 +1198,7 @@ namespace Realm {
       if(inputs.size() == 2) {
 	IndexSpaceIterator<N,T> it_lhs(inputs[0]);
 	IndexSpaceIterator<N,T> it_rhs(inputs[1]);
-       
+
 	// can only generate data while both sides have rectangles left
 	while(it_lhs.valid && it_rhs.valid) {
 	  // skip rectangles if they completely preceed the one on the other side
@@ -1655,6 +1655,14 @@ namespace Realm {
   template <int N, typename T>
   void UnionOperation<N,T>::execute(void)
   {
+
+    const char* val = std::getenv("GPU_UNION");  // or any env var
+    if (val) {
+      GPUUnionMicroOp<N, T> *uop = new GPUUnionMicroOp<N,T>(inputs, outputs);
+      uop->dispatch(this, true /* ok to run in this thread */);
+      return;
+    }
+
     for(size_t i = 0; i < outputs.size(); i++) {
       SparsityMapImpl<N,T>::lookup(outputs[i])->set_contributor_count(1);
 
@@ -1692,7 +1700,7 @@ namespace Realm {
   {
     IndexSpace<N,T> output;
     output.bounds = lhs.bounds.intersection(rhs.bounds);
-    
+
     if(output.bounds.empty()) {
       // this optimization should be handled earlier
       assert(0);
@@ -1870,6 +1878,36 @@ namespace Realm {
     os << "DifferenceOperation";
   }
 
+  template <int N, typename T>
+  GPUUnionMicroOp<N, T>::GPUUnionMicroOp(const std::vector<std::vector<IndexSpace<N,T> > > &_inputs,
+                    const std::vector<SparsityMap<N,T> > &_sparsity_outputs)
+      : inputs(_inputs), sparsity_outputs(_sparsity_outputs) {}
+
+  template <int N, typename T>
+  GPUUnionMicroOp<N, T>::~GPUUnionMicroOp() {}
+
+  template <int N, typename T>
+  void GPUUnionMicroOp<N, T>::dispatch(
+      PartitioningOperation *op, bool inline_ok) {
+
+    for (size_t i = 0; i < inputs.size(); i++) {
+      for (size_t j = 0; j < inputs[i].size(); j++) {
+        if (!inputs[i][j].dense()) {
+          bool registered = SparsityMapImpl<N, T>::lookup(inputs[i][j].sparsity)
+                                ->add_waiter(this, true /*precise*/);
+          if (registered) this->wait_count.fetch_add(1);
+        }
+      }
+    }
+    this->finish_dispatch(op, inline_ok);
+  }
+
+  template <int N, typename T>
+  void GPUUnionMicroOp<N, T>::execute(void) {
+    TimeStamp ts("GPUUnionMicroOp::execute", true, &log_uop_timing);
+    gpu_populate();
+  }
+
 
 #define DOIT(N,T) \
   template class UnionMicroOp<N,T>; \
@@ -1878,6 +1916,7 @@ namespace Realm {
   template class UnionOperation<N,T>; \
   template class IntersectionOperation<N,T>; \
   template class DifferenceOperation<N,T>; \
+  template class GPUUnionMicroOp<N,T>; \
   template UnionMicroOp<N,T>::UnionMicroOp(NodeID, AsyncMicroOp *, Serialization::FixedBufferDeserializer&); \
   template IntersectionMicroOp<N,T>::IntersectionMicroOp(NodeID, AsyncMicroOp *, Serialization::FixedBufferDeserializer&); \
   template DifferenceMicroOp<N,T>::DifferenceMicroOp(NodeID, AsyncMicroOp *, Serialization::FixedBufferDeserializer&); \

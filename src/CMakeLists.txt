@@ -64,6 +64,7 @@ set(REALM_SOURCES
     deppart/setops.cc
     deppart/sparsity_impl.cc
     deppart/untemplated_gpu_kernels.cu
+    deppart/setops_gpu.cu
     numa/numa_module.cc
     numa/numasysif.cc
     procset/procset_module.cc
