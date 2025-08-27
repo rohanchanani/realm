@@ -1,5 +1,7 @@
 #include "realm/deppart/setops.h"
+#define REALM_DEFINE_BVH_KERNELS
 #include "realm/deppart/setops_gpu_kernels.hpp"
+#undef REALM_DEFINE_BVH_KERNELS
 #include "realm/deppart/partitions_gpu_impl.hpp"
 #include <cub/cub.cuh>
 #include "realm/nvtx.h"
@@ -106,8 +108,593 @@ void GPUUnionMicroOp<N, T>::gpu_populate(void) {
 
 }
 
+  template <int N, typename T>
+  void GPUIntersectionMicroOp<N, T>::gpu_populate_single(void) {
+    Memory my_mem;
+    bool found_gpu_memory = false;
+    Machine machine = Machine::get_machine();
+    std::set<Memory> all_memories;
+    machine.get_all_memories(all_memories);
+    for(auto& memory : all_memories) {
+      if(memory.kind() == Memory::GPU_FB_MEM) {
+        my_mem = memory;
+        found_gpu_memory = true;
+        break;
+      }
+    }
+    assert(found_gpu_memory);
+    if (sparsity_outputs.size() == 0) {
+       return;
+    }
+      nvtx_range_push("cuda", "gpu_intersection_populate");
+
+      cudaStream_t stream;
+      CUDA_CHECK(cudaStreamCreate(&stream), stream);
+
+      nvtx_range_push("cuda", "flatten sparsity and inst entries");
+
+      // 1) figure out the final size and build the offsets array
+      size_t lhs_size = inputs[0][0].dense() ? 1 : inputs[0][0].sparsity.impl()->get_entries().size();
+
+      // inputs entries allocation
+      RegionInstance lhs_entries_instance = this->realm_malloc(lhs_size * sizeof(SparsityMapEntry<N,T>), my_mem);
+      SparsityMapEntry<N,T>* d_lhs_entries = reinterpret_cast<SparsityMapEntry<N,T>*>(AffineAccessor<char,1>(lhs_entries_instance, 0).base);
+
+      if (inputs[0][0].dense()) {
+        // just one rect
+        SparsityMapEntry<N,T> entry;
+        entry.bounds = inputs[0][0].bounds;
+        CUDA_CHECK(cudaMemcpyAsync(d_lhs_entries, &entry, sizeof(SparsityMapEntry<N,T>), cudaMemcpyHostToDevice, stream), stream);
+      } else {
+        auto& tmp = inputs[0][0].sparsity.impl()->get_entries();
+        CUDA_CHECK(cudaMemcpyAsync(d_lhs_entries, tmp.data(), tmp.size() * sizeof(SparsityMapEntry<N,T>), cudaMemcpyHostToDevice, stream), stream);
+      }
+
+      RegionInstance lhs_rects_instance = this->realm_malloc(lhs_size * sizeof(RectDesc<N,T>), my_mem);
+      RectDesc<N, T>* d_lhs_rects = reinterpret_cast<RectDesc<N,T>*>(AffineAccessor<char,1>(lhs_rects_instance, 0).base);
+
+      int threads_per_block = 256;
+      int grid_size = (lhs_size + threads_per_block - 1) / threads_per_block;
+
+      single_map_rects<N,T><<<grid_size, threads_per_block, 0, stream>>>(d_lhs_entries, lhs_size, d_lhs_rects);
+      KERNEL_CHECK(stream);
+
+      for (size_t i = 1; i < inputs[0].size(); i++) {
+
+        size_t rhs_size = inputs[0][i].dense() ? 1 : inputs[0][i].sparsity.impl()->get_entries().size();
+
+        RegionInstance rhs_entries_instance = this->realm_malloc(rhs_size * sizeof(SparsityMapEntry<N,T>), my_mem);
+        SparsityMapEntry<N,T>* d_rhs_entries = reinterpret_cast<SparsityMapEntry<N,T>*>(AffineAccessor<char,1>(rhs_entries_instance, 0).base);
+
+        if (inputs[0][i].dense()) {
+          // just one rect
+          SparsityMapEntry<N,T> entry;
+          entry.bounds = inputs[0][i].bounds;
+          CUDA_CHECK(cudaMemcpyAsync(d_rhs_entries, &entry, sizeof(SparsityMapEntry<N,T>), cudaMemcpyHostToDevice, stream), stream);
+        } else {
+          auto& tmp = inputs[0][i].sparsity.impl()->get_entries();
+          CUDA_CHECK(cudaMemcpyAsync(d_rhs_entries, tmp.data(), tmp.size() * sizeof(SparsityMapEntry<N,T>), cudaMemcpyHostToDevice, stream), stream);
+        }
+
+        RegionInstance rhs_rects_instance = this->realm_malloc(rhs_size * sizeof(RectDesc<N,T>), my_mem);
+        RectDesc<N, T>* d_rhs_rects = reinterpret_cast<RectDesc<N,T>*>(AffineAccessor<char,1>(rhs_rects_instance, 0).base);
+
+        grid_size = (rhs_size + threads_per_block - 1) / threads_per_block;
+
+        single_map_rects<N,T><<<grid_size, threads_per_block, 0, stream>>>(d_rhs_entries, rhs_size, d_rhs_rects);
+        KERNEL_CHECK(stream);
+
+        Rect<N, T> global_bounds = inputs[0][i].bounds;
+
+        RegionInstance global_bounds_instance = this->realm_malloc(sizeof(Rect<N,T>), my_mem);
+        Rect<N,T>* d_global_bounds = reinterpret_cast<Rect<N,T>*>(AffineAccessor<char,1>(global_bounds_instance, 0).base);
+        CUDA_CHECK(cudaMemcpyAsync(d_global_bounds, &global_bounds, sizeof(Rect<N,T>), cudaMemcpyHostToDevice, stream), stream);
+
+        RegionInstance morton_codes_instance = this->realm_malloc(rhs_size * sizeof(uint64_t), my_mem);
+        uint64_t* d_morton_codes = reinterpret_cast<uint64_t*>(AffineAccessor<char,1>(morton_codes_instance, 0).base);
+
+        RegionInstance indices_instance = this->realm_malloc(rhs_size * sizeof(uint64_t), my_mem);
+        uint64_t* d_indices = reinterpret_cast<uint64_t*>(AffineAccessor<char,1>(indices_instance, 0).base);
+
+        RegionInstance rhs_indices_instance = this->realm_malloc(rhs_size * sizeof(size_t), my_mem);
+        size_t* d_rhs_indices = reinterpret_cast<size_t*>(AffineAccessor<char,1>(rhs_indices_instance, 0).base);
+
+        threads_per_block = 256;
+        grid_size = (rhs_size + threads_per_block - 1) / threads_per_block;
+
+        bvh_build_morton_codes<<<grid_size, threads_per_block, 0, stream>>>(d_rhs_rects, d_global_bounds, rhs_size, d_morton_codes, d_indices, d_rhs_indices);
+        KERNEL_CHECK(stream);
+
+          RegionInstance morton_codes_out_instance = this->realm_malloc(rhs_size * sizeof(uint64_t), my_mem);
+          uint64_t* d_morton_codes_out = reinterpret_cast<uint64_t*>(AffineAccessor<char,1>(morton_codes_out_instance, 0).base);
+
+          RegionInstance indices_out_instance = this->realm_malloc(rhs_size * sizeof(uint64_t), my_mem);
+          uint64_t* d_indices_out = reinterpret_cast<uint64_t*>(AffineAccessor<char,1>(indices_out_instance, 0).base);
+
+          void *bvh_temp = nullptr;
+          size_t bvh_temp_bytes = 0;
+          cub::DeviceRadixSort::SortPairs(bvh_temp, bvh_temp_bytes, d_morton_codes, d_morton_codes_out, d_indices,
+                                          d_indices_out, rhs_size, 0, 64, stream);
+          RegionInstance bvh_temp_instance = this->realm_malloc(bvh_temp_bytes, my_mem);
+          bvh_temp = reinterpret_cast<void*>(AffineAccessor<char,1>(bvh_temp_instance, 0).base);
+          cub::DeviceRadixSort::SortPairs(bvh_temp, bvh_temp_bytes, d_morton_codes, d_morton_codes_out, d_indices,
+                                          d_indices_out, rhs_size, 0, 64, stream);
+
+          std::swap(d_morton_codes, d_morton_codes_out);
+          std::swap(d_indices, d_indices_out);
+
+          RegionInstance childLeft_instance = this->realm_malloc((2*rhs_size - 1) * sizeof(int), my_mem);
+          int* d_childLeft = reinterpret_cast<int*>(AffineAccessor<char,1>(childLeft_instance, 0).base);
+
+          RegionInstance childRight_instance = this->realm_malloc((2*rhs_size - 1) * sizeof(int), my_mem);
+          int* d_childRight = reinterpret_cast<int*>(AffineAccessor<char,1>(childRight_instance, 0).base);
+
+          RegionInstance parent_instance = this->realm_malloc((2*rhs_size - 1) * sizeof(int), my_mem);
+          int* d_parent = reinterpret_cast<int*>(AffineAccessor<char,1>(parent_instance, 0).base);
+
+          CUDA_CHECK(cudaMemsetAsync(d_parent, -1, (2*rhs_size - 1) * sizeof(int), stream), stream);
+
+          threads_per_block = 256;
+          grid_size = ((rhs_size - 1) + threads_per_block - 1) / threads_per_block;
+
+          int n = (int) rhs_size;
+          bvh_build_radix_tree_kernel<<< grid_size, threads_per_block, 0, stream>>>(d_morton_codes, d_indices, n, d_childLeft, d_childRight, d_parent);
+          KERNEL_CHECK(stream);
+
+          RegionInstance root_instance = this->realm_malloc(sizeof(int), my_mem);
+          int* d_root = reinterpret_cast<int*>(AffineAccessor<char,1>(root_instance, 0).base);
+
+          CUDA_CHECK(cudaMemsetAsync(d_root, -1, sizeof(int), stream), stream);
+
+          threads_per_block = 256;
+          grid_size = (2 * rhs_size - 1 + threads_per_block - 1) / threads_per_block;
+          bvh_build_root_kernel<<< grid_size, threads_per_block, 0, stream>>>(d_root, d_parent, rhs_size);
+          KERNEL_CHECK(stream);
+
+          int root;
+          CUDA_CHECK(cudaMemcpyAsync(&root, d_root, sizeof(int), cudaMemcpyDeviceToHost, stream), stream);
+          CUDA_CHECK(cudaStreamSynchronize(stream), stream);
+
+
+          RegionInstance boxes_instance = this->realm_malloc((2*rhs_size - 1) * sizeof(Rect<N,T>), my_mem);
+          Rect<N,T>* d_boxes = reinterpret_cast<Rect<N,T>*>(AffineAccessor<char,1>(boxes_instance, 0).base);
+
+          threads_per_block = 256;
+          grid_size = ((rhs_size) + threads_per_block - 1) / threads_per_block;
+          bvh_init_leaf_boxes_kernel<N, T><<<grid_size, threads_per_block, 0, stream>>>(d_rhs_rects, d_indices, rhs_size, d_boxes);
+          KERNEL_CHECK(stream);
+
+          RegionInstance visitCount_instance = this->realm_malloc((2*rhs_size - 1) * sizeof(int), my_mem);
+          int* d_visitCount = reinterpret_cast<int*>(AffineAccessor<char,1>(visitCount_instance, 0).base);
+          CUDA_CHECK(cudaMemsetAsync(d_visitCount, 0, (2*rhs_size - 1) * sizeof(int), stream), stream);
+
+          threads_per_block = 256;
+          grid_size = (rhs_size + threads_per_block - 1) / threads_per_block;
+          bvh_merge_internal_boxes_kernel < N, T ><<< grid_size, threads_per_block, 0, stream>>>(rhs_size, d_childLeft, d_childRight, d_parent, d_boxes, d_visitCount);
+          KERNEL_CHECK(stream);
+
+          RegionInstance input_counters_instance = this->realm_malloc(inputs.size() * sizeof(uint32_t), my_mem);
+          uint32_t* d_input_counters = reinterpret_cast<uint32_t*>(AffineAccessor<char,1>(input_counters_instance, 0).base);
+          CUDA_CHECK(cudaMemsetAsync(d_input_counters, 0, inputs.size() * sizeof(uint32_t), stream), stream);
+
+
+          grid_size = (lhs_size + threads_per_block - 1) / threads_per_block;
+          intersect_query_bvh< N, T ><<<grid_size, threads_per_block, 0, stream>>>(d_lhs_rects, d_root, d_childLeft, d_childRight, d_indices, d_rhs_indices, d_boxes, lhs_size, rhs_size, nullptr, d_input_counters, nullptr);
+          KERNEL_CHECK(stream);
+
+          uint32_t h_input_counters[inputs.size()+1];
+          h_input_counters[0] = 0; // prefix sum starts at 0
+          CUDA_CHECK(cudaMemcpyAsync(h_input_counters+1, d_input_counters, inputs.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost, stream), stream);
+          CUDA_CHECK(cudaStreamSynchronize(stream), stream);
+          for (size_t i = 0; i < inputs.size(); ++i) {
+            h_input_counters[i+1] += h_input_counters[i];
+          }
+
+          uint32_t num_valid_rects = h_input_counters[inputs.size()];
+
+          if (num_valid_rects==0) {
+            CUDA_CHECK(cudaStreamSynchronize(stream), stream);
+            cudaStreamDestroy(stream);
+            nvtx_range_pop();
+            nvtx_range_pop();
+            morton_codes_instance.destroy();
+            indices_instance.destroy();
+            rhs_indices_instance.destroy();
+            morton_codes_out_instance.destroy();
+            indices_out_instance.destroy();
+            bvh_temp_instance.destroy();
+            childLeft_instance.destroy();
+            childRight_instance.destroy();
+            parent_instance.destroy();
+            root_instance.destroy();
+            boxes_instance.destroy();
+            visitCount_instance.destroy();
+            input_counters_instance.destroy();
+            lhs_rects_instance.destroy();
+            rhs_rects_instance.destroy();
+            rhs_entries_instance.destroy();
+            global_bounds_instance.destroy();
+            lhs_entries_instance.destroy();
+            for (auto it : sparsity_outputs) {
+              SparsityMapImpl<N, T> *impl = SparsityMapImpl<N, T>::lookup(it);
+              impl->gpu_finalize();
+            }
+            return;
+          }
+
+          RegionInstance inputs_prefix_instance = this->realm_malloc((inputs.size() + 1) * sizeof(uint32_t), my_mem);
+          uint32_t* d_inputs_prefix = reinterpret_cast<uint32_t*>(AffineAccessor<char,1>(inputs_prefix_instance, 0).base);
+          CUDA_CHECK(cudaMemcpyAsync(d_inputs_prefix, h_input_counters, (inputs.size() + 1) * sizeof(uint32_t), cudaMemcpyHostToDevice, stream), stream);
+
+          RegionInstance output_instance = this->realm_malloc(num_valid_rects * sizeof(RectDesc<N,T>), my_mem);
+          RectDesc<N, T>* d_output_rects = reinterpret_cast<RectDesc<N,T>*>(AffineAccessor<char,1>(output_instance, 0).base);
+
+          CUDA_CHECK(cudaMemsetAsync(d_input_counters, 0, (inputs.size()) * sizeof(uint32_t), stream), stream);
+
+          intersect_query_bvh< N, T ><<<grid_size, threads_per_block, 0, stream>>>(d_lhs_rects, d_root, d_childLeft, d_childRight, d_indices, d_rhs_indices, d_boxes, lhs_size, rhs_size, d_inputs_prefix, d_input_counters, d_output_rects);
+          KERNEL_CHECK(stream);
+          CUDA_CHECK(cudaStreamSynchronize(stream), stream);
+          morton_codes_instance.destroy();
+          indices_instance.destroy();
+          rhs_indices_instance.destroy();
+          morton_codes_out_instance.destroy();
+          indices_out_instance.destroy();
+          bvh_temp_instance.destroy();
+          childLeft_instance.destroy();
+          childRight_instance.destroy();
+          parent_instance.destroy();
+          root_instance.destroy();
+          boxes_instance.destroy();
+          visitCount_instance.destroy();
+          input_counters_instance.destroy();
+          inputs_prefix_instance.destroy();
+          lhs_rects_instance.destroy();
+          rhs_rects_instance.destroy();
+          rhs_entries_instance.destroy();
+          global_bounds_instance.destroy();
+
+          lhs_rects_instance = output_instance;
+          d_lhs_rects = d_output_rects;
+          lhs_size = num_valid_rects;
+
+      }
+
+
+      this->complete_rect_pipeline(d_lhs_rects, lhs_size, my_mem,
+      /* the Container: */  sparsity_outputs,
+      /* getIndex: */       [&](auto const& elem){
+                              // elem is a SparsityMap<N,T> from the vector
+                              return size_t(&elem - sparsity_outputs.data());
+                           },
+      /* getMap: */         [&](auto const& elem){
+                            // return the SparsityMap key itself
+                            return elem;
+                         });
+
+    nvtx_range_pop();
+    nvtx_range_pop();
+    CUDA_CHECK(cudaStreamDestroy(stream), stream);
+    lhs_entries_instance.destroy();
+    lhs_rects_instance.destroy();
+  }
+
+template <int N, typename T>
+void GPUIntersectionMicroOp<N, T>::gpu_populate_multiple(void) {
+  Memory my_mem;
+  bool found_gpu_memory = false;
+  Machine machine = Machine::get_machine();
+  std::set<Memory> all_memories;
+  machine.get_all_memories(all_memories);
+  for(auto& memory : all_memories) {
+    if(memory.kind() == Memory::GPU_FB_MEM) {
+      my_mem = memory;
+      found_gpu_memory = true;
+      break;
+    }
+  }
+  assert(found_gpu_memory);
+  if (sparsity_outputs.size() == 0) {
+     return;
+  }
+    nvtx_range_push("cuda", "gpu_intersection_populate");
+
+    cudaStream_t stream;
+    CUDA_CHECK(cudaStreamCreate(&stream), stream);
+
+    nvtx_range_push("cuda", "flatten sparsity and inst entries");
+
+    // 1) figure out the final size and build the offsets array
+    std::vector<size_t> lhs_offsets(inputs.size() + 1);
+    std::vector<size_t> rhs_offsets(inputs.size() + 1);
+    size_t lhs_size = 0;
+    size_t rhs_size = 0;
+    for (size_t i = 0; i < inputs.size(); ++i) {
+      lhs_offsets[i] = lhs_size;
+      rhs_offsets[i] = rhs_size;
+      if (inputs[i][0].dense()) {
+        lhs_size += 1;
+      } else {
+        // only call get_entries() once per input
+        lhs_size += inputs[i][0].sparsity.impl()->get_entries().size();
+      }
+      if (inputs[i][1].dense()) {
+        rhs_size += 1;
+      } else {
+        // only call get_entries() once per input
+        rhs_size += inputs[i][1].sparsity.impl()->get_entries().size();
+      }
+    }
+    // final end offset
+    lhs_offsets[inputs.size()] = lhs_size;
+    rhs_offsets[inputs.size()] = rhs_size;
+
+    nvtx_range_pop();
+    nvtx_range_push("cuda", "build device entries");
+
+    // inputs entries allocation
+    RegionInstance lhs_entries_instance = this->realm_malloc(lhs_size * sizeof(SparsityMapEntry<N,T>), my_mem);
+    SparsityMapEntry<N,T>* d_lhs_entries = reinterpret_cast<SparsityMapEntry<N,T>*>(AffineAccessor<char,1>(lhs_entries_instance, 0).base);
+
+    RegionInstance rhs_entries_instance = this->realm_malloc(rhs_size * sizeof(SparsityMapEntry<N,T>), my_mem);
+    SparsityMapEntry<N,T>* d_rhs_entries = reinterpret_cast<SparsityMapEntry<N,T>*>(AffineAccessor<char,1>(rhs_entries_instance, 0).base);
+
+    // Offsets allocation
+    RegionInstance offsets_instance = this->realm_malloc(2*(inputs.size()+1) * sizeof(size_t), my_mem);
+    size_t* d_lhs_offsets = reinterpret_cast<size_t*>(AffineAccessor<char,1>(offsets_instance, 0).base);
+    size_t* d_rhs_offsets = d_lhs_offsets + (inputs.size() + 1);
+
+    CUDA_CHECK(cudaMemcpyAsync(d_lhs_offsets, lhs_offsets.data(), (inputs.size()+1) * sizeof(size_t), cudaMemcpyHostToDevice, stream), stream);
+    CUDA_CHECK(cudaMemcpyAsync(d_rhs_offsets, rhs_offsets.data(), (inputs.size()+1) * sizeof(size_t), cudaMemcpyHostToDevice, stream), stream);
+
+    // 3) fill in place
+    size_t l_pos = 0;
+    size_t r_pos = 0;
+    for (size_t i = 0; i < inputs.size(); ++i) {
+      if (inputs[i][0].dense()) {
+        // just one rect
+        SparsityMapEntry<N,T> entry;
+        entry.bounds = inputs[i][0].bounds;
+        CUDA_CHECK(cudaMemcpyAsync(d_lhs_entries + l_pos, &entry, sizeof(SparsityMapEntry<N,T>), cudaMemcpyHostToDevice, stream), stream);
+        ++l_pos;
+      } else {
+          auto& tmp = inputs[i][0].sparsity.impl()->get_entries();
+          CUDA_CHECK(cudaMemcpyAsync(d_lhs_entries + l_pos, tmp.data(), tmp.size() * sizeof(SparsityMapEntry<N,T>), cudaMemcpyHostToDevice, stream), stream);
+          l_pos += tmp.size();
+      }
+      if (inputs[i][1].dense()) {
+        // just one rect
+        SparsityMapEntry<N,T> entry;
+        entry.bounds = inputs[i][1].bounds;
+        CUDA_CHECK(cudaMemcpyAsync(d_rhs_entries + r_pos, &entry, sizeof(SparsityMapEntry<N,T>), cudaMemcpyHostToDevice, stream), stream);
+        ++r_pos;
+      } else {
+        auto& tmp = inputs[i][1].sparsity.impl()->get_entries();
+        CUDA_CHECK(cudaMemcpyAsync(d_rhs_entries + r_pos, tmp.data(), tmp.size() * sizeof(SparsityMapEntry<N,T>), cudaMemcpyHostToDevice, stream), stream);
+        r_pos += tmp.size();
+      }
+    }
+
+    RegionInstance output_rects_instance = this->realm_malloc((lhs_size+rhs_size) * sizeof(RectDesc<N,T>), my_mem);
+    RectDesc<N, T>* d_lhs_rects = reinterpret_cast<RectDesc<N,T>*>(AffineAccessor<char,1>(output_rects_instance, 0).base);
+    RectDesc<N, T>* d_rhs_rects = d_lhs_rects + lhs_size;
+
+    int threads_per_block = 256;
+    int grid_size = (lhs_size + threads_per_block - 1) / threads_per_block;
+
+    union_map_rects<N,T><<<grid_size, threads_per_block, 0, stream>>>(d_lhs_entries, d_lhs_offsets, lhs_size, inputs.size(), d_lhs_rects);
+    KERNEL_CHECK(stream);
+
+    grid_size = (rhs_size + threads_per_block - 1) / threads_per_block;
+    union_map_rects<N,T><<<grid_size, threads_per_block, 0, stream>>>(d_rhs_entries, d_rhs_offsets, rhs_size, inputs.size(), d_rhs_rects);
+    KERNEL_CHECK(stream);
+
+    Rect<N, T> global_bounds;
+    if (lhs_size > rhs_size) {
+        std::swap(d_lhs_rects,  d_rhs_rects);
+        std::swap(lhs_size, rhs_size);
+        global_bounds = inputs[0][0].bounds;
+        for (size_t i = 1; i < inputs.size(); ++i) {
+          global_bounds = global_bounds.union_bbox(inputs[i][0].bounds);
+        }
+    } else {
+        global_bounds = inputs[0][1].bounds;
+        for (size_t i = 1; i < inputs.size(); ++i) {
+          global_bounds = global_bounds.union_bbox(inputs[i][1].bounds);
+        }
+    }
+
+    RegionInstance global_bounds_instance = this->realm_malloc(sizeof(Rect<N,T>), my_mem);
+    Rect<N,T>* d_global_bounds = reinterpret_cast<Rect<N,T>*>(AffineAccessor<char,1>(global_bounds_instance, 0).base);
+    CUDA_CHECK(cudaMemcpyAsync(d_global_bounds, &global_bounds, sizeof(Rect<N,T>), cudaMemcpyHostToDevice, stream), stream);
+
+    RegionInstance morton_codes_instance = this->realm_malloc(rhs_size * sizeof(uint64_t), my_mem);
+    uint64_t* d_morton_codes = reinterpret_cast<uint64_t*>(AffineAccessor<char,1>(morton_codes_instance, 0).base);
+
+    RegionInstance indices_instance = this->realm_malloc(rhs_size * sizeof(uint64_t), my_mem);
+    uint64_t* d_indices = reinterpret_cast<uint64_t*>(AffineAccessor<char,1>(indices_instance, 0).base);
+
+    RegionInstance rhs_indices_instance = this->realm_malloc(rhs_size * sizeof(size_t), my_mem);
+    size_t* d_rhs_indices = reinterpret_cast<size_t*>(AffineAccessor<char,1>(rhs_indices_instance, 0).base);
+
+    threads_per_block = 256;
+    grid_size = (rhs_size + threads_per_block - 1) / threads_per_block;
+
+    bvh_build_morton_codes<<<grid_size, threads_per_block, 0, stream>>>(d_rhs_rects, d_global_bounds, rhs_size, d_morton_codes, d_indices, d_rhs_indices);
+    KERNEL_CHECK(stream);
+
+      RegionInstance morton_codes_out_instance = this->realm_malloc(rhs_size * sizeof(uint64_t), my_mem);
+      uint64_t* d_morton_codes_out = reinterpret_cast<uint64_t*>(AffineAccessor<char,1>(morton_codes_out_instance, 0).base);
+
+      RegionInstance indices_out_instance = this->realm_malloc(rhs_size * sizeof(uint64_t), my_mem);
+      uint64_t* d_indices_out = reinterpret_cast<uint64_t*>(AffineAccessor<char,1>(indices_out_instance, 0).base);
+
+      void *bvh_temp = nullptr;
+      size_t bvh_temp_bytes = 0;
+      cub::DeviceRadixSort::SortPairs(bvh_temp, bvh_temp_bytes, d_morton_codes, d_morton_codes_out, d_indices,
+                                      d_indices_out, rhs_size, 0, 64, stream);
+      RegionInstance bvh_temp_instance = this->realm_malloc(bvh_temp_bytes, my_mem);
+      bvh_temp = reinterpret_cast<void*>(AffineAccessor<char,1>(bvh_temp_instance, 0).base);
+      cub::DeviceRadixSort::SortPairs(bvh_temp, bvh_temp_bytes, d_morton_codes, d_morton_codes_out, d_indices,
+                                      d_indices_out, rhs_size, 0, 64, stream);
+
+      std::swap(d_morton_codes, d_morton_codes_out);
+      std::swap(d_indices, d_indices_out);
+
+      RegionInstance childLeft_instance = this->realm_malloc((2*rhs_size - 1) * sizeof(int), my_mem);
+      int* d_childLeft = reinterpret_cast<int*>(AffineAccessor<char,1>(childLeft_instance, 0).base);
+
+      RegionInstance childRight_instance = this->realm_malloc((2*rhs_size - 1) * sizeof(int), my_mem);
+      int* d_childRight = reinterpret_cast<int*>(AffineAccessor<char,1>(childRight_instance, 0).base);
+
+      RegionInstance parent_instance = this->realm_malloc((2*rhs_size - 1) * sizeof(int), my_mem);
+      int* d_parent = reinterpret_cast<int*>(AffineAccessor<char,1>(parent_instance, 0).base);
+
+      CUDA_CHECK(cudaMemsetAsync(d_parent, -1, (2*rhs_size - 1) * sizeof(int), stream), stream);
+
+      threads_per_block = 256;
+      grid_size = ((rhs_size - 1) + threads_per_block - 1) / threads_per_block;
+
+      int n = (int) rhs_size;
+      bvh_build_radix_tree_kernel<<< grid_size, threads_per_block, 0, stream>>>(d_morton_codes, d_indices, n, d_childLeft, d_childRight, d_parent);
+      KERNEL_CHECK(stream);
+
+      RegionInstance root_instance = this->realm_malloc(sizeof(int), my_mem);
+      int* d_root = reinterpret_cast<int*>(AffineAccessor<char,1>(root_instance, 0).base);
+
+      CUDA_CHECK(cudaMemsetAsync(d_root, -1, sizeof(int), stream), stream);
+
+      threads_per_block = 256;
+      grid_size = (2 * rhs_size - 1 + threads_per_block - 1) / threads_per_block;
+      bvh_build_root_kernel<<< grid_size, threads_per_block, 0, stream>>>(d_root, d_parent, rhs_size);
+      KERNEL_CHECK(stream);
+
+      int root;
+      CUDA_CHECK(cudaMemcpyAsync(&root, d_root, sizeof(int), cudaMemcpyDeviceToHost, stream), stream);
+      CUDA_CHECK(cudaStreamSynchronize(stream), stream);
+
+
+      RegionInstance boxes_instance = this->realm_malloc((2*rhs_size - 1) * sizeof(Rect<N,T>), my_mem);
+      Rect<N,T>* d_boxes = reinterpret_cast<Rect<N,T>*>(AffineAccessor<char,1>(boxes_instance, 0).base);
+
+      threads_per_block = 256;
+      grid_size = ((rhs_size) + threads_per_block - 1) / threads_per_block;
+      bvh_init_leaf_boxes_kernel<N, T><<<grid_size, threads_per_block, 0, stream>>>(d_rhs_rects, d_indices, rhs_size, d_boxes);
+      KERNEL_CHECK(stream);
+
+      RegionInstance visitCount_instance = this->realm_malloc((2*rhs_size - 1) * sizeof(int), my_mem);
+      int* d_visitCount = reinterpret_cast<int*>(AffineAccessor<char,1>(visitCount_instance, 0).base);
+      CUDA_CHECK(cudaMemsetAsync(d_visitCount, 0, (2*rhs_size - 1) * sizeof(int), stream), stream);
+
+      threads_per_block = 256;
+      grid_size = (rhs_size + threads_per_block - 1) / threads_per_block;
+      bvh_merge_internal_boxes_kernel < N, T ><<< grid_size, threads_per_block, 0, stream>>>(rhs_size, d_childLeft, d_childRight, d_parent, d_boxes, d_visitCount);
+      KERNEL_CHECK(stream);
+
+      RegionInstance input_counters_instance = this->realm_malloc(inputs.size() * sizeof(uint32_t), my_mem);
+      uint32_t* d_input_counters = reinterpret_cast<uint32_t*>(AffineAccessor<char,1>(input_counters_instance, 0).base);
+      CUDA_CHECK(cudaMemsetAsync(d_input_counters, 0, inputs.size() * sizeof(uint32_t), stream), stream);
+
+
+      grid_size = (lhs_size + threads_per_block - 1) / threads_per_block;
+      intersect_query_bvh< N, T ><<<grid_size, threads_per_block, 0, stream>>>(d_lhs_rects, d_root, d_childLeft, d_childRight, d_indices, d_rhs_indices, d_boxes, lhs_size, rhs_size, nullptr, d_input_counters, nullptr);
+      KERNEL_CHECK(stream);
+
+      uint32_t h_input_counters[inputs.size()+1];
+      h_input_counters[0] = 0; // prefix sum starts at 0
+      CUDA_CHECK(cudaMemcpyAsync(h_input_counters+1, d_input_counters, inputs.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost, stream), stream);
+      CUDA_CHECK(cudaStreamSynchronize(stream), stream);
+      for (size_t i = 0; i < inputs.size(); ++i) {
+        h_input_counters[i+1] += h_input_counters[i];
+      }
+
+      uint32_t num_valid_rects = h_input_counters[inputs.size()];
+
+      if (num_valid_rects==0) {
+        CUDA_CHECK(cudaStreamSynchronize(stream), stream);
+        for (auto it : sparsity_outputs) {
+          SparsityMapImpl<N, T> *impl = SparsityMapImpl<N, T>::lookup(it);
+          impl->gpu_finalize();
+        }
+        morton_codes_instance.destroy();
+        indices_instance.destroy();
+        rhs_indices_instance.destroy();
+        morton_codes_out_instance.destroy();
+        indices_out_instance.destroy();
+        bvh_temp_instance.destroy();
+        childLeft_instance.destroy();
+        childRight_instance.destroy();
+        parent_instance.destroy();
+        root_instance.destroy();
+        boxes_instance.destroy();
+        visitCount_instance.destroy();
+        input_counters_instance.destroy();
+        lhs_entries_instance.destroy();
+        rhs_entries_instance.destroy();
+        offsets_instance.destroy();
+        output_rects_instance.destroy();
+        global_bounds_instance.destroy();
+        nvtx_range_pop();
+        nvtx_range_pop();
+        cudaStreamDestroy(stream);
+        return;
+      }
+
+      RegionInstance inputs_prefix_instance = this->realm_malloc((inputs.size() + 1) * sizeof(uint32_t), my_mem);
+      uint32_t* d_inputs_prefix = reinterpret_cast<uint32_t*>(AffineAccessor<char,1>(inputs_prefix_instance, 0).base);
+      CUDA_CHECK(cudaMemcpyAsync(d_inputs_prefix, h_input_counters, (inputs.size() + 1) * sizeof(uint32_t), cudaMemcpyHostToDevice, stream), stream);
+
+      RegionInstance output_instance = this->realm_malloc(num_valid_rects * sizeof(RectDesc<N,T>), my_mem);
+      RectDesc<N, T>* d_output_rects = reinterpret_cast<RectDesc<N,T>*>(AffineAccessor<char,1>(output_instance, 0).base);
+
+      CUDA_CHECK(cudaMemsetAsync(d_input_counters, 0, (inputs.size()) * sizeof(uint32_t), stream), stream);
+
+      intersect_query_bvh< N, T ><<<grid_size, threads_per_block, 0, stream>>>(d_lhs_rects, d_root, d_childLeft, d_childRight, d_indices, d_rhs_indices, d_boxes, lhs_size, rhs_size, d_inputs_prefix, d_input_counters, d_output_rects);
+      KERNEL_CHECK(stream);
+      CUDA_CHECK(cudaStreamSynchronize(stream), stream);
+      morton_codes_instance.destroy();
+      indices_instance.destroy();
+      rhs_indices_instance.destroy();
+      morton_codes_out_instance.destroy();
+      indices_out_instance.destroy();
+      bvh_temp_instance.destroy();
+      childLeft_instance.destroy();
+      childRight_instance.destroy();
+      parent_instance.destroy();
+      root_instance.destroy();
+      boxes_instance.destroy();
+      visitCount_instance.destroy();
+      input_counters_instance.destroy();
+      inputs_prefix_instance.destroy();
+
+
+    this->complete_rect_pipeline(d_output_rects, num_valid_rects, my_mem,
+    /* the Container: */  sparsity_outputs,
+    /* getIndex: */       [&](auto const& elem){
+                            // elem is a SparsityMap<N,T> from the vector
+                            return size_t(&elem - sparsity_outputs.data());
+                         },
+    /* getMap: */         [&](auto const& elem){
+                          // return the SparsityMap key itself
+                          return elem;
+                       });
+
+  CUDA_CHECK(cudaStreamDestroy(stream), stream);
+  lhs_entries_instance.destroy();
+  rhs_entries_instance.destroy();
+  offsets_instance.destroy();
+  output_rects_instance.destroy();
+  global_bounds_instance.destroy();
+  output_instance.destroy();
+
+  nvtx_range_pop();
+  nvtx_range_pop();
+
+}
+
+
   #define DOIT(N,T) \
     template class GPUUnionMicroOp<N,T>; \
+    template class GPUIntersectionMicroOp<N,T>;
 
   FOREACH_NT(DOIT)
 

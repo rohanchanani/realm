@@ -1783,6 +1783,14 @@ namespace Realm {
   template <int N, typename T>
   void IntersectionOperation<N,T>::execute(void)
   {
+
+    const char* val = std::getenv("GPU_INTERSECTION");  // or any env var
+    if (val) {
+      GPUIntersectionMicroOp<N, T> *uop = new GPUIntersectionMicroOp<N,T>(inputs, outputs);
+      uop->dispatch(this, true /* ok to run in this thread */);
+      return;
+    }
+
     for(size_t i = 0; i < outputs.size(); i++) {
       SparsityMapImpl<N,T>::lookup(outputs[i])->set_contributor_count(1);
 
@@ -1908,6 +1916,41 @@ namespace Realm {
     gpu_populate();
   }
 
+  template <int N, typename T>
+  GPUIntersectionMicroOp<N, T>::GPUIntersectionMicroOp(std::vector<std::vector<IndexSpace<N,T> > > _inputs,
+                    std::vector<SparsityMap<N,T> > _sparsity_outputs)
+      : inputs(_inputs), sparsity_outputs(_sparsity_outputs) {}
+
+  template <int N, typename T>
+  GPUIntersectionMicroOp<N, T>::~GPUIntersectionMicroOp() {}
+
+  template <int N, typename T>
+  void GPUIntersectionMicroOp<N, T>::dispatch(
+      PartitioningOperation *op, bool inline_ok) {
+
+    for (size_t i = 0; i < inputs.size(); i++) {
+      for (size_t j = 0; j < inputs[i].size(); j++) {
+        if (!inputs[i][j].dense()) {
+          bool registered = SparsityMapImpl<N, T>::lookup(inputs[i][j].sparsity)
+                                ->add_waiter(this, true /*precise*/);
+          if (registered) this->wait_count.fetch_add(1);
+        }
+      }
+    }
+    this->finish_dispatch(op, inline_ok);
+  }
+
+  template <int N, typename T>
+  void GPUIntersectionMicroOp<N, T>::execute(void) {
+    TimeStamp ts("GPUUnionMicroOp::execute", true, &log_uop_timing);
+    std::stringstream ss;
+    if (sparsity_outputs.size()==1) {
+      gpu_populate_single();
+    } else {
+      gpu_populate_multiple();
+    }
+  }
+
 
 #define DOIT(N,T) \
   template class UnionMicroOp<N,T>; \
@@ -1917,6 +1960,7 @@ namespace Realm {
   template class IntersectionOperation<N,T>; \
   template class DifferenceOperation<N,T>; \
   template class GPUUnionMicroOp<N,T>; \
+  template class GPUIntersectionMicroOp<N,T>; \
   template UnionMicroOp<N,T>::UnionMicroOp(NodeID, AsyncMicroOp *, Serialization::FixedBufferDeserializer&); \
   template IntersectionMicroOp<N,T>::IntersectionMicroOp(NodeID, AsyncMicroOp *, Serialization::FixedBufferDeserializer&); \
   template DifferenceMicroOp<N,T>::DifferenceMicroOp(NodeID, AsyncMicroOp *, Serialization::FixedBufferDeserializer&); \
