@@ -46,7 +46,8 @@ namespace Realm {
 
 #define DOIT(T1,T2)			                                                                                             \
   template class StructuredImageMicroOp<N1,T1,N2,T2>;                                                                \
-  template class ImageMicroOp<N1,T1,N2,T2>;                                                                          \
+  template class ImageMicroOp<N1,T1,N2,T2>;																			 \
+  template class GPUImageMicroOp<N1, T1, N2, T2>;																	 \
   template class ImageOperation<N1,T1,N2,T2>;                                                                        \
   template ImageMicroOp<N1,T1,N2,T2>::ImageMicroOp(NodeID, AsyncMicroOp *, Serialization::FixedBufferDeserializer&); \
   template Event IndexSpace<N1, T1>::create_subspaces_by_image(                                                      \

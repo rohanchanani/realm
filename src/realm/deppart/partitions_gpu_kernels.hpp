@@ -260,12 +260,373 @@ void query_input_bvh(
 }
 
 template<int N, typename T>
+struct CornerDesc {
+    uint32_t src_idx;
+    T        coord[N];
+    int32_t  delta;
+
+    // Equality for ReduceByKey: compare key fields only (src_idx, coords)
+    __host__ __device__ __forceinline__
+    bool operator==(const CornerDesc& rhs) const {
+      if (src_idx != rhs.src_idx) return false;
+      for (int d = 0; d < N; ++d)
+        if (coord[d] != rhs.coord[d]) return false;
+      return true;
+    }
+};
+
+template<int N, typename T>
+__global__ void mark_endpoints(const RectDesc<N,T>* d_rects,
+                                size_t            M,
+                                int               dim,
+                                uint32_t*       d_src_keys,
+                                T*       d_crd_keys) {
+  size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if(i >= M) return;
+  d_src_keys[2*i] = d_rects[i].src_idx;
+  d_src_keys[2*i+1] = d_rects[i].src_idx;
+  d_crd_keys[2*i] = d_rects[i].rect.lo[dim];
+  d_crd_keys[2*i+1] = d_rects[i].rect.hi[dim] + 1;
+}
+
+template<typename T>
+__global__ void mark_heads(const uint32_t* d_src_keys,
+                                  const T* d_crd_keys,
+                                  size_t            M,
+                                  uint8_t* d_heads) {
+  size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if(i >= M) return;
+  if (i==0) d_heads[0] = 1;
+  else {
+    d_heads[i] = d_src_keys[i] != d_src_keys[i-1] || d_crd_keys[i] != d_crd_keys[i-1];
+  }
+}
+
+template<typename T>
+__global__ void seg_boundaries(const uint8_t* d_flags,
+                              const T* d_exc_sum,
+                              size_t            M,
+                              size_t *d_starts,
+                              size_t *d_ends) {
+  size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if(i >= M) return;
+  if (d_flags[i]) {
+    d_starts[d_exc_sum[i]-1] = i;
+  }
+  if (i== M-1 || d_flags[i+1]) {
+    d_ends[d_exc_sum[i]-1] = i + 1;
+  }
+}
+
+template<typename T>
+__global__ void scatter_unique(const uint32_t* d_src_keys,
+                                const T* d_crd_keys,
+                                const size_t* d_output,
+                                const uint8_t* d_heads,
+                                size_t            M,
+                                size_t *d_starts,
+                                size_t *d_ends,
+                                T* d_boundaries) {
+  size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if(i >= M) return;
+  size_t u = d_output[i] - (d_heads[i] ? 0 : 1);
+  d_boundaries[u] = d_crd_keys[i];
+  if (i == 0 || d_src_keys[i] != d_src_keys[i-1]) {
+    d_starts[d_src_keys[i]] = u;
+  }
+  if (i== M-1 || d_src_keys[i] != d_src_keys[i+1]) {
+    d_ends[d_src_keys[i]] = u + 1;
+  }
+}
+
+template<int N, typename T>
+__global__ void mark_deltas_heads(const CornerDesc<N, T>* d_corners,
+                                size_t            M,
+                                int dim,
+                                uint8_t* d_heads,
+                                DeltaFlag* d_deltas) {
+  size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if(i >= M) return;
+  uint8_t head = 1;
+  if (i>0) {
+    head = 0;
+    for (int j = 0; j < N; j++) {
+      if (j== dim) continue;
+      if (d_corners[i].coord[j] != d_corners[i-1].coord[j]) {
+        head = 1;
+        break;
+      }
+    }
+    head = head || d_corners[i].src_idx != d_corners[i-1].src_idx;
+  }
+  d_heads[i] = head;
+  d_deltas[i].delta = d_corners[i].delta;
+  d_deltas[i].head = head;
+}
+
+// For each segment and each boundary, determine whether to emit a new subsegment
+template<int N, typename T>
+__global__ void count_segments(const DeltaFlag* d_delta_flags,
+                                const size_t *d_segment_starts,
+                                const size_t *d_segment_ends,
+                                const size_t *d_boundary_starts,
+                                const size_t *d_boundary_ends,
+                                const CornerDesc<N, T>* d_corners,
+                                const T* d_boundaries,
+                                size_t num_boundaries,
+                                size_t num_segments,
+                                int dim,
+                                uint32_t *seg_counters) {
+  size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if(i >= num_segments * num_boundaries) return;
+  size_t bnd_idx = i % num_boundaries;
+  size_t seg_idx = i / num_boundaries;
+  int my_src = d_corners[d_segment_starts[seg_idx]].src_idx;
+
+  //No boundaries for this src
+  if (d_boundary_starts[my_src]>= d_boundary_ends[my_src]) return;
+
+  //This boundary is not a subsegment start for this segment's src
+  if (bnd_idx < d_boundary_starts[my_src] || bnd_idx >= d_boundary_ends[my_src]-1) return;
+
+  //Binary search the segment to find the first subsegment whose start is > boundary
+  size_t low = d_segment_starts[seg_idx];
+  size_t high = d_segment_ends[seg_idx];
+  while (low < high) {
+    int mid = (low + high) / 2;
+    if (d_corners[mid].coord[dim] <= d_boundaries[bnd_idx]) {
+      low = mid + 1;
+    } else {
+      high = mid;
+    }
+  }
+
+  //The prefix sum for this boundary within this segment is the delta of the corner just before it (if any)
+  int my_delta = (low == d_segment_starts[seg_idx] ? 0 : d_delta_flags[low-1].delta);
+
+  //We emit if it's non-zero, and strengthen the requirement to > 0 for dim 0.
+  if (my_delta != 0 && (dim !=0 || my_delta > 0)) {
+    atomicAdd(&seg_counters[seg_idx], 1);
+  }
+}
+
+//Do the same computation as above, but this time emit the actual subsegment
+template<int N, typename T>
+__global__ void write_segments(const DeltaFlag* d_delta_flags,
+                                const size_t *d_segment_starts,
+                                const size_t *d_segment_ends,
+                                const size_t *d_boundary_starts,
+                                const size_t *d_boundary_ends,
+                                const CornerDesc<N, T>* d_corners,
+                                const T* d_boundaries,
+                                const uint32_t *seg_offsets,
+                                size_t num_boundaries,
+                                size_t num_segments,
+                                int dim,
+                                uint32_t *seg_counters,
+                                CornerDesc<N, T>* d_out_corners) {
+  size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if(i >= num_segments * num_boundaries) return;
+  size_t bnd_idx = i % num_boundaries;
+  size_t seg_idx = i / num_boundaries;
+  int my_src = d_corners[d_segment_starts[seg_idx]].src_idx;
+  if (d_boundary_starts[my_src]>= d_boundary_ends[my_src]) return;
+  if (bnd_idx < d_boundary_starts[my_src] || bnd_idx >= d_boundary_ends[my_src]-1) return;
+  size_t low = d_segment_starts[seg_idx];
+  size_t high = d_segment_ends[seg_idx];
+  while (low < high) {
+    int mid = (low + high) / 2;
+    if (d_corners[mid].coord[dim] <= d_boundaries[bnd_idx]) {
+      low = mid + 1;
+    } else {
+      high = mid;
+    }
+  }
+  int my_delta = (low == d_segment_starts[seg_idx] ? 0 : d_delta_flags[low-1].delta);
+
+  //To emit, we keep everything the same except the current dim - set that to the boundary value
+  if (my_delta != 0 && (dim !=0 || my_delta > 0)) {
+    uint32_t my_idx = seg_offsets[seg_idx] + atomicAdd(&seg_counters[seg_idx], 1);
+    CornerDesc<N, T> my_corner = d_corners[low-1];
+    my_corner.coord[dim] = d_boundaries[bnd_idx];
+    my_corner.delta = my_delta;
+    d_out_corners[my_idx] = my_corner;
+  }
+}
+
+//Again, do the same computation as above, but this time emit the actual rectangle
+template<int N, typename T>
+__global__ void write_segments(const DeltaFlag* d_delta_flags,
+                                const size_t *d_segment_starts,
+                                const size_t *d_segment_ends,
+                                size_t **d_boundary_starts,
+                                size_t **d_boundary_ends,
+                                const CornerDesc<N, T>* d_corners,
+                                T** d_boundaries,
+                                const uint32_t *seg_offsets,
+                                size_t num_boundaries,
+                                size_t num_segments,
+                                uint32_t *seg_counters,
+                                RectDesc<N, T>* d_out_rects) {
+  size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if(i >= num_segments * num_boundaries) return;
+  size_t bnd_idx = i % num_boundaries;
+  size_t seg_idx = i / num_boundaries;
+  int my_src = d_corners[d_segment_starts[seg_idx]].src_idx;
+  if (d_boundary_starts[0][my_src]>= d_boundary_ends[0][my_src]) return;
+  if (bnd_idx < d_boundary_starts[0][my_src] || bnd_idx >= d_boundary_ends[0][my_src]-1) return;
+
+  size_t low = d_segment_starts[seg_idx];
+  size_t high = d_segment_ends[seg_idx];
+  while (low < high) {
+    int mid = (low + high) / 2;
+    if (d_corners[mid].coord[0] <= d_boundaries[0][bnd_idx]) {
+      low = mid + 1;
+    } else {
+      high = mid;
+    }
+  }
+  int my_delta = (low == d_segment_starts[seg_idx] ? 0 : d_delta_flags[low-1].delta);
+  if (my_delta==0) return;
+  int my_corner_idx = low - 1;
+  uint32_t my_idx = seg_offsets[seg_idx] + atomicAdd(&seg_counters[seg_idx], 1);
+  RectDesc<N, T> my_output;
+  my_output.src_idx = my_src;
+  my_output.rect.lo[0] = d_boundaries[0][bnd_idx];
+
+  //Remember we marked each boundary as hi+1, so need to revert
+  my_output.rect.hi[0] = d_boundaries[0][bnd_idx+1] - 1;
+
+  //For every other dimension, map segment -> rect by finding the two boundaries that surround the segment's corner
+  for (int d = 1; d < N; d++) {
+    low = d_boundary_starts[d][my_src];
+    high = d_boundary_ends[d][my_src];
+    while (low < high) {
+      int mid = (low + high) / 2;
+      if (d_boundaries[d][mid] <= d_corners[my_corner_idx].coord[d]) {
+        low = mid + 1;
+      } else {
+        high = mid;
+      }
+    }
+    my_output.rect.lo[d] = d_boundaries[d][low-1];
+    my_output.rect.hi[d] = d_boundaries[d][low] - 1;
+  }
+  d_out_rects[my_idx] = my_output;
+}
+
+  template<int N, typename T>
+  __global__ void populate_corners(const RectDesc<N, T>* __restrict__ d_rects,
+                                   size_t M,
+                                   CornerDesc<N, T>* __restrict__ d_corners)
+{
+  const size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= M) return;
+
+  const auto& r = d_rects[i];            // assumes r.rect.lo[d], r.rect.hi[d], r.src_idx
+  const uint32_t src = r.src_idx;
+
+  const size_t corners_per_rect = size_t(1) << N;
+  const size_t base = i * corners_per_rect;
+
+  // emit 2^N corners. Each 1 in the mask -> use hi[d]+1, each 0 -> use lo[d]
+  for (unsigned mask = 0; mask < corners_per_rect; ++mask) {
+    CornerDesc<N,T> c;
+    c.src_idx = src;
+    // sign = +1 for even popcount(mask), -1 for odd
+    c.delta = (__popc(mask) & 1) ? -1 : +1;
+
+    #pragma unroll
+    for (int d = 0; d < N; ++d) {
+      const T lo   = r.rect.lo[d];
+      const T hip1 = r.rect.hi[d] + T(1);   // half-open (hi+1)
+      c.coord[d]   = ( (mask & (1u << d)) ? hip1 : lo );
+    }
+
+    d_corners[base + mask] = c;
+  }
+}
+
+
+template<int N, typename T>
 __global__ void build_coord_key(T*        d_keys,
                                 const PointDesc<N,T>* d_pts,
                                 size_t            M,
                                 int               dim) {
   size_t i = blockIdx.x * blockDim.x + threadIdx.x;
   if(i < M) d_keys[i] = d_pts[i].point[dim];
+}
+
+
+template<int N, typename T>
+__global__ void build_coord_key(T*        d_keys,
+                                const CornerDesc<N,T>* d_corners,
+                                size_t            M,
+                                int               dim) {
+  size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if(i < M) d_keys[i] = d_corners[i].coord[dim];
+}
+
+template<int N, typename T>
+__global__ void get_delta(int32_t*        d_deltas,
+                                const CornerDesc<N,T>* d_corners,
+                                size_t            M) {
+  size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if(i < M) d_deltas[i] = d_corners[i].delta;
+}
+
+template<int N, typename T>
+__global__ void set_delta(const int32_t*        d_deltas,
+                                CornerDesc<N,T>* d_corners,
+                                size_t            M) {
+  size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if(i < M) d_corners[i].delta = d_deltas[i];
+}
+
+
+  template<int N, typename T>
+__global__ void build_lo_key(T*        d_keys,
+                                const RectDesc<N,T>* d_rects,
+                                size_t            M,
+                                int               dim) {
+  size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if(i < M) d_keys[i] = d_rects[i].rect.lo[dim];
+}
+
+  template<int N, typename T>
+__global__ void build_hi_key(T*        d_keys,
+                                const RectDesc<N,T>* d_rects,
+                                size_t            M,
+                                int               dim) {
+  size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if(i < M) d_keys[i] = d_rects[i].rect.hi[dim];
+}
+
+  template<int N, typename T>
+__global__ void build_hi_flag(HiFlag<T>*        d_flags,
+                              const RectDesc<N,T>* d_rects,
+                              size_t            M,
+                              int               dim) {
+  size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if(i >= M) return;
+  d_flags[i].hi = d_rects[i].rect.hi[dim];
+  d_flags[i].head = i==0 || d_rects[i].src_idx != d_rects[i-1].src_idx;
+}
+
+  template<int N, typename T>
+__global__ void build_src_key(size_t*        d_keys,
+                              const RectDesc<N,T>* d_rects,
+                              size_t            M) {
+  size_t i = blockIdx.x*blockDim.x + threadIdx.x;
+  if(i < M) d_keys[i] = d_rects[i].src_idx;
+}
+
+  template<int N, typename T>
+__global__ void build_src_key(size_t*        d_keys,
+                              const CornerDesc<N, T> *d_corners,
+                              size_t            M) {
+  size_t i = blockIdx.x*blockDim.x + threadIdx.x;
+  if(i < M) d_keys[i] = d_corners[i].src_idx;
 }
 
 template<int N, typename T>
@@ -275,12 +636,13 @@ __global__ void build_src_key(size_t*        d_keys,
   size_t i = blockIdx.x*blockDim.x + threadIdx.x;
   if(i < M) d_keys[i] = d_pts[i].src_idx;
 }
+  
 
-  template<int N, typename T>
-  __global__
-  void points_to_rects(const PointDesc<N,T>* pts,
-                       RectDesc<N,T>*        rects,
-                       size_t                M)
+template<int N, typename T>
+__global__
+void points_to_rects(const PointDesc<N,T>* pts,
+                     RectDesc<N,T>*        rects,
+                     size_t                M)
 {
   size_t i = blockIdx.x*blockDim.x + threadIdx.x;
   if(i >= M) return;
@@ -290,13 +652,15 @@ __global__ void build_src_key(size_t*        d_keys,
 }
 
 // 1) mark breaks on RectDesc array at pass d
-//NOTE: ONLY WORKS IF WE STARTED WITH SINGLETONS
+// Starts a new rectangle if src or lo/hi in any dimension but d doesn't match,
+// or if dim d doesn't match or advance by +1
+//NOTE: ONLY WORKS IF WE STARTED WITH DISJOINT RECTANGLES
 template<int N, typename T>
 __global__
 void mark_breaks_dim(const RectDesc<N,T>* in,
-                       uint8_t*              brk,
-                       size_t                M,
-                       int                   d)
+                     uint8_t*              brk,
+                     size_t                M,
+                     int                   d)
 {
   size_t i = blockIdx.x*blockDim.x + threadIdx.x;
   if(i >= M) return;
@@ -305,13 +669,13 @@ void mark_breaks_dim(const RectDesc<N,T>* in,
   const auto &p = in[i].rect, &q = in[i-1].rect;
   bool split = (in[i].src_idx != in[i-1].src_idx);
 
-  // more‐significant dims 0..d-1 must match lo
-#pragma unroll
+  // more‐significant dims 0..d-1 must match [lo,hi]
+  #pragma unroll
   for(int k = 0; k < d && !split; ++k)
     if(p.lo[k] != q.lo[k] || p.hi[k] != q.hi[k]) split = true;
 
   // already‐processed dims d+1..N-1 must match [lo,hi]
-#pragma unroll
+  #pragma unroll
   for(int k = d+1; k < N && !split; ++k)
     if((p.lo[k] != q.lo[k]) || (p.hi[k] != q.hi[k]))
       split = true;
@@ -323,8 +687,23 @@ void mark_breaks_dim(const RectDesc<N,T>* in,
   brk[i] = split ? 1 : 0;
 }
 
-// Write output rectangles for RLE
-//Starts write lo, ends write hi, everyone else no-ops
+//1) Mark breaks for 1D rectangle merge - if low > hi + 1, must start new rect
+  template<int N, typename T>
+__global__
+void mark_breaks_dim(const HiFlag<T>* hi_flag_in,
+                     const HiFlag<T>* hi_flag_out,
+                     const RectDesc<N,T>* in,
+                     uint8_t*              brk,
+                     size_t                M,
+                     int                   d)
+{
+  size_t i = blockIdx.x*blockDim.x + threadIdx.x;
+  if(i >= M) return;
+  brk[i] = hi_flag_in[i].head || in[i].rect.lo[d] > hi_flag_out[i].hi + 1;
+}
+
+// 2) Write output rectangles for ND disjoint rects RLE
+// Starts write lo, ends write hi, everyone else no-ops
 template<int N, typename T>
 __global__
 void init_rects_dim(const RectDesc<N,T>* in,
@@ -351,6 +730,42 @@ void init_rects_dim(const RectDesc<N,T>* in,
     }
     if (is_end) {
         out[g].rect.hi[k] = r.hi[k];
+    }
+  }
+}
+
+  // 2) Write output rectangles for 1D rects RLE
+  // Starts write lo, ends write max(hi, prefix max hi) because the max was exclusive
+  template<int N, typename T>
+  __global__
+  void init_rects_dim(const RectDesc<N,T>* in,
+                      const HiFlag<T> *hi_flag_out,
+                      const uint8_t*        brk,
+                      const size_t*         gid,
+                      RectDesc<N,T>*        out,
+                      size_t                M,
+                      int                   d)
+{
+  size_t i = blockIdx.x*blockDim.x + threadIdx.x;
+  if(i >= M) return;
+
+  bool is_end = (i == M-1) || (gid[i+1] != gid[i]);
+  if (!brk[i] && !is_end) return;
+
+  size_t g = gid[i] - 1;  // zero-based
+  const auto &r = in[i].rect;
+  out[g].src_idx = in[i].src_idx;
+
+  // copy dims ≠ d
+#pragma unroll
+  for(int k = 0; k < N; ++k) {
+    if (brk[i]) {
+      out[g].rect.lo[k] = r.lo[k];
+    }
+    if (k != d || (brk[i] && is_end)) {
+      out[g].rect.hi[k] = r.hi[k];
+    } else if (is_end) {
+      out[g].rect.hi[k] = r.hi[k] > hi_flag_out[i].hi ? r.hi[k] : hi_flag_out[i].hi;
     }
   }
 }
@@ -382,4 +797,4 @@ void build_final_output(const RectDesc<N,T>* d_rects,
   }
 }
 
-}
+} // namespace Realm

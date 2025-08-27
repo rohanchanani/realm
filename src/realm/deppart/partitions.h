@@ -43,11 +43,21 @@ namespace Realm {
   class PartitioningMicroOp;
   class PartitioningOperation;
 
+  template<typename T>
+  struct HiFlag {
+    T hi;
+    uint8_t head;
+  };
+
+  struct DeltaFlag {
+    int32_t delta;
+    uint8_t head;
+  };
+
   // Data representations for GPU micro-ops
   // src idx tracks which subspace each rect/point
   // belongs to and allows multiple subspaces to be
   // computed together in a micro-op
-
   template<int N, typename T>
   struct RectDesc {
     Rect<N,T> rect;
@@ -202,8 +212,8 @@ namespace Realm {
 
     virtual void execute(void) = 0;
 
-    template <typename FT>
-    static void collapse_inst_space(const std::vector<FieldDataDescriptor<IndexSpace<N, T>, FT> >& field_data, RegionInstance& out_instance, collapsed_space<N, T> &out_space, Memory my_mem, cudaStream_t stream);
+    template <typename space_t>
+    static void collapse_multi_space(const std::vector<space_t>& field_data, RegionInstance& out_instance, collapsed_space<N, T> &out_space, Memory my_mem, cudaStream_t stream);
 
     static void collapse_parent_space(const IndexSpace<N, T>& parent_space, RegionInstance& out_instance, collapsed_space<N, T> &out_space, Memory my_mem, cudaStream_t stream);
 
@@ -217,6 +227,12 @@ namespace Realm {
 
     template<typename Container, typename IndexFn, typename MapFn>
     void complete_pipeline(PointDesc<N, T>* d_points, size_t total_pts, Memory my_mem, const Container& ctr, IndexFn getIndex, MapFn getMap);
+
+    template<typename Container, typename IndexFn, typename MapFn>
+    void complete_rect_pipeline(RectDesc<N, T>* d_rects, size_t total_rects, Memory my_mem, const Container& ctr, IndexFn getIndex, MapFn getMap);
+
+    template<typename Container, typename IndexFn, typename MapFn>
+    void complete1d_pipeline(RectDesc<N, T>* d_rects, size_t total_rects, Memory my_mem, const Container& ctr, IndexFn getIndex, MapFn getMap);
 
     template<typename Container, typename IndexFn, typename MapFn>
     void send_output(RectDesc<N, T>* d_rects, size_t total_rects, Memory my_mem, const Container& ctr, IndexFn getIndex, MapFn getMap);

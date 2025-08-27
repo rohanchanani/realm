@@ -17,7 +17,6 @@
 // ImageMicroOp<…>::gpu_populate_bitmasks_ptrs
 
 
-#include "realm/deppart/partitions_gpu_kernels.hpp"
 #include "realm/deppart/partitions_gpu_impl.hpp"
 #include "realm/deppart/inst_helper.h"
 

@@ -34,7 +34,7 @@ void GPUByFieldMicroOp<N,T,FT>::execute()
 
   RegionInstance inst_entries_instance;
 
-  GPUMicroOp<N, T>::collapse_inst_space(field_data, inst_entries_instance, inst_space, my_mem, stream);
+  GPUMicroOp<N, T>::collapse_multi_space(field_data, inst_entries_instance, inst_space, my_mem, stream);
 
   RegionInstance parent_entries_instance;
   collapsed_space<N, T> collapsed_parent;
