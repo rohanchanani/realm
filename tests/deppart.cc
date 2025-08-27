@@ -195,7 +195,6 @@ public:
       }
     }
 
-
     if (num_nodes <= 0 || num_pieces <= 0 || num_edges <= 0) {
       log_app.error() << "Invalid config: nodes=" << num_nodes << " edges=" << num_edges << " pieces=" << num_pieces << "\n";
       exit(1);
@@ -344,7 +343,6 @@ public:
       piece_id_field_data[i].inst = ri_nodes[i];
       piece_id_field_data[i].field_offset = 0;
     }
-
 
     // Fire off tasks to initialize data
     ri_edges.resize(num_pieces);
