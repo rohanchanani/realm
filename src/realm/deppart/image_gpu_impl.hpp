@@ -174,8 +174,8 @@ void GPUImageMicroOp<N,T,N2,T2>::gpu_populate_rngs()
     RegionInstance valid_intersect_instance = this->realm_malloc(num_valid_output * sizeof(RectDesc<N,T>), my_mem);
     RectDesc<N,T>* d_valid_intersect = reinterpret_cast<RectDesc<N,T>*>(AffineAccessor<char,1>(valid_intersect_instance, 0).base);
 
-    RegionInstance src_prefix_instance = this->realm_malloc((sources.size() + 1) * sizeof(size_t), my_mem);
-    size_t* d_src_prefix = reinterpret_cast<size_t*>(AffineAccessor<char,1>(src_prefix_instance, 0).base);
+    RegionInstance src_prefix_instance = this->realm_malloc((sources.size() + 1) * sizeof(uint32_t), my_mem);
+    uint32_t* d_src_prefix = reinterpret_cast<uint32_t*>(AffineAccessor<char,1>(src_prefix_instance, 0).base);
     CUDA_CHECK(cudaMemcpyAsync(d_src_prefix, h_src_counters.data(), (sources.size() + 1) * sizeof(size_t), cudaMemcpyHostToDevice, stream), stream);
 
     CUDA_CHECK(cudaMemsetAsync(d_src_counters, 0, sources.size() * sizeof(uint32_t), stream), stream);

@@ -92,7 +92,7 @@ void image_gpuPopulateBitmasksPtrsKernel(
 __global__ void image_intersect_output(
   const SparsityMapEntry<N,T>* d_parent_entries,
   const RectDesc<N,T>* d_output_rngs,
-  const size_t* d_src_prefix,
+  const uint32_t* d_src_prefix,
   size_t numParentRects,
   size_t numOutputRects,
   uint32_t* d_src_counters,
