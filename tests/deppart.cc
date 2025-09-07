@@ -805,14 +805,15 @@ public:
     log_app.debug() << "N: " << is_nodes;
     log_app.debug() << "E: " << is_rects;
 
+    //Write out colors and rectangles
+
     {
-      AffineAccessor<int,1> a_piece_id(i_args.ri_rects, 0 /* offset */);
-      //std::cout << "a_subckt_id = " << a_subckt_id << "\n";
+      AffineAccessor<int,1> a_rect_id(i_args.ri_rects, 0 /* offset */);
 
       for(int i = is_rects.bounds.lo; i <= is_rects.bounds.hi; i++) {
 	      int subgraph;
 	      random_rect_data(i, subgraph);
-	      a_piece_id.write(i, subgraph);
+	      a_rect_id.write(i, subgraph);
       }
     }
     {
@@ -827,16 +828,13 @@ public:
 
 
     {
-      //std::cout << "a_in_node = " << a_in_node << "\n";
-      //std::cout << "a_out_node = " << a_out_node << "\n";
 
-      AffineAccessor<Rect<1>, 1> a_rect(i_args.ri_rects, 1 * sizeof(int) /* offset */);
+      AffineAccessor<Rect<1>, 1> a_rect_val(i_args.ri_rects, 1 * sizeof(int) /* offset */);
 
-      // Read edges line by line
       for(int i = is_rects.bounds.lo; i <= is_rects.bounds.hi; i++) {
         Rect<1> rect;
         initialize_rect_data(i, rect, max_rect_size);
-        a_rect.write(i, rect);
+        a_rect_val.write(i, rect);
       }
     }
 
@@ -844,17 +842,17 @@ public:
       AffineAccessor<int,1> a_piece_id(i_args.ri_nodes, 0 /* offset */);
 
       for(int i = is_nodes.bounds.lo; i <= is_nodes.bounds.hi; i++)
-	std::cout << "node_id[" << i << "] = " << a_piece_id.read(i) << std::endl;
+	log_app.info() << "node_id[" << i << "] = " << a_piece_id.read(i) << "\n";
 
       AffineAccessor<int,1> a_rect_id(i_args.ri_rects, 0 * sizeof(Point<1>) /* offset */);
 
       for(int i = is_rects.bounds.lo; i <= is_rects.bounds.hi; i++)
-	std::cout << "rect_id[" << i << "] = " << a_rect_id.read(i) << std::endl;
+	log_app.info() << "rect_id[" << i << "] = " << a_rect_id.read(i) << "\n";
 
       AffineAccessor<Rect<1>,1> a_rect_val(i_args.ri_rects, 1 * sizeof(int) /* offset */);
 
       for(int i = is_rects.bounds.lo; i <= is_rects.bounds.hi; i++)
-	std::cout << "rect_val[" << i << "] = " << a_rect_val.read(i) << std::endl;
+	log_app.info() << "rect_val[" << i << "] = " << a_rect_val.read(i) << "\n";
     }
   }
 
@@ -882,7 +880,7 @@ public:
     std::vector<IndexSpace<1> > ss_nodes_eq;
     std::vector<IndexSpace<1> > ss_rects_eq;
 
-    std::cout << "Creating equal subspaces" << std::endl;
+    log_app.info() << "Creating equal subspaces" << "\n";
 
     is_nodes.create_equal_subspaces(num_pieces, 1, ss_nodes_eq, Realm::ProfilingRequestSet()).wait();
     is_rects.create_equal_subspaces(num_pieces, 1, ss_rects_eq, Realm::ProfilingRequestSet()).wait();
@@ -956,17 +954,14 @@ public:
   }
 
   // the outputs of our partitioning will be:
-  //  is_private, is_shared - subsets of is_nodes based on private/shared
-  //  p_rd, p_wr, p_ghost - subsets of the above split by subckt
-  //  p_edges               - subsets of is_edges for each subckt
+  //p_colored_rects -> all of our rectangles marked with the color given by random_rect_data
+  //p_rects -> image range by p colored rects into nodes
 
   std::vector<IndexSpace<1> > p_colored_rects, p_rects;
   std::vector<IndexSpace<1> > p_colored_rects_cpu, p_rects_cpu;
 
   virtual Event perform_partitioning(void)
   {
-    // first partition nodes by subckt id (this is the independent partition,
-    //  but not actually used by the app)
 
     std::vector<int> colors(num_pieces);
     for(int i = 0; i < num_pieces; i++)
@@ -1063,7 +1058,7 @@ public:
     }
     wait_on_events = true;
     std::vector<IndexSpace<1>> p_garbage_rects, p_garbage_colors;
-    std::cout << "WARMING UP " << std::endl;
+    log_app.info() << "WARMING UP " << "\n";
 
     Event e001 = is_rects.create_subspaces_by_field(rect_id_data_gpu,
                                                   colors,
@@ -1077,10 +1072,10 @@ public:
                                                      e001);
     if(wait_on_events) e002.wait();
 
-    std::cout << "FINISHED WARMING UP " << std::endl;
-    std::cout << "starting GPU  partitioning " << Clock::current_time_in_microseconds() << std::endl;
+    log_app.info() << "FINISHED WARMING UP " << "\n";
+    log_app.info() << "starting GPU  partitioning " << Clock::current_time_in_microseconds() << "\n";
 
-    std::cout << "STARTING GPU BY FIELD " << Clock::current_time_in_microseconds() << std::endl;
+    log_app.info() << "STARTING GPU BY FIELD " << Clock::current_time_in_microseconds() << "\n";
 
     Event e01 = is_rects.create_subspaces_by_field(rect_id_data_gpu,
                                                   colors,
@@ -1088,8 +1083,8 @@ public:
                                                   Realm::ProfilingRequestSet());
         if (wait_on_events) e01.wait();
 
-    std::cout << "FINISHED GPU BY FIELD " << Clock::current_time_in_microseconds() << std::endl;
-    std::cout << "STARTING GPU BY IMAGE " << Clock::current_time_in_microseconds() << std::endl;
+    log_app.info() << "FINISHED GPU BY FIELD " << Clock::current_time_in_microseconds() << "\n";
+    log_app.info() << "STARTING GPU BY IMAGE " << Clock::current_time_in_microseconds() << "\n";
     Event e02 = is_nodes.create_subspaces_by_image(rect_val_data_gpu,
                                                      p_colored_rects,
                                                      p_rects,
@@ -1097,54 +1092,25 @@ public:
                                                      e01);
     if(wait_on_events) e02.wait();
 
-    std::cout << "FINISHED GPU BY IMAGE " << Clock::current_time_in_microseconds() << std::endl;
-    std::cout << "STARTING CPU  partitioning " << Clock::current_time_in_microseconds() << std::endl;
-    std::cout << "STARTING CPU BY FIELD " << Clock::current_time_in_microseconds() << std::endl;
+    log_app.info() << "FINISHED GPU BY IMAGE " << Clock::current_time_in_microseconds() << "\n";
+    log_app.info() << "STARTING CPU  partitioning " << Clock::current_time_in_microseconds() << "\n";
+    log_app.info() << "STARTING CPU BY FIELD " << Clock::current_time_in_microseconds() << "\n";
     Event e1 = is_rects.create_subspaces_by_field(rect_id_field_data,
                                                   colors,
                                                   p_colored_rects_cpu,
                                                   Realm::ProfilingRequestSet());
     if (wait_on_events) e1.wait();
-    std::cout << "FINISHED CPU BY FIELD " << Clock::current_time_in_microseconds() << std::endl;
-    std::cout << "STARTING CPU BY IMAGE " << Clock::current_time_in_microseconds() << std::endl;
+    log_app.info() << "FINISHED CPU BY FIELD " << Clock::current_time_in_microseconds() << "\n";
+    log_app.info() << "STARTING CPU BY IMAGE " << Clock::current_time_in_microseconds() << "\n";
     Event e2 = is_nodes.create_subspaces_by_image(rect_val_field_data,
                                                      p_colored_rects_cpu,
                                                      p_rects_cpu,
                                                      Realm::ProfilingRequestSet(),
                                                      e1);
     if(wait_on_events) e2.wait();
-    std::cout << "FINISHED CPU BY IMAGE " << Clock::current_time_in_microseconds() << std::endl;
-    std::cout << "CPU Partitioning complete " << Clock::current_time_in_microseconds() << std::endl;
-
-    std::cout << "Checking correctness of partitioning " << std::endl;
-
-
-    for (int i = 0; i < num_pieces; i++) {
-      for (IndexSpaceIterator<1> it(p_colored_rects[i]); it.valid; it.step()) {
-        for (PointInRectIterator<1> point(it.rect); point.valid; point.step()) {
-          assert(p_colored_rects_cpu[i].contains(point.p));
-        }
-      }
-      for (IndexSpaceIterator<1> it(p_colored_rects_cpu[i]); it.valid; it.step()) {
-        for (PointInRectIterator<1> point(it.rect); point.valid; point.step()) {
-          assert(p_colored_rects[i].contains(point.p));
-        }
-      }
-      for (IndexSpaceIterator<1> it(p_rects[i]); it.valid; it.step()) {
-        for (PointInRectIterator<1> point(it.rect); point.valid; point.step()) {
-          assert(p_rects_cpu[i].contains(point.p));
-        }
-      }
-      for (IndexSpaceIterator<1> it(p_rects_cpu[i]); it.valid; it.step()) {
-        for (PointInRectIterator<1> point(it.rect); point.valid; point.step()) {
-          assert(p_rects[i].contains(point.p));
-        }
-      }
-    }
-
-    std::cout << "Partitioning correctness check passed " << std::endl;
-    exit(0);
-    return e02;
+    log_app.info() << "FINISHED CPU BY IMAGE " << Clock::current_time_in_microseconds() << "\n";
+    log_app.info() << "CPU Partitioning complete " << Clock::current_time_in_microseconds() << "\n";
+    return e2;
   }
 
 
@@ -1156,7 +1122,48 @@ public:
 
   virtual int check_partitioning(void)
   {
-    return 0;
+    log_app.info() << "Checking correctness of partitioning " << "\n";
+    int errors = 0;
+
+    for (int i = 0; i < num_pieces; i++) {
+      for (IndexSpaceIterator<1> it(p_colored_rects[i]); it.valid; it.step()) {
+        for (PointInRectIterator<1> point(it.rect); point.valid; point.step()) {
+          if (!p_colored_rects_cpu[i].contains(point.p)) {
+            log_app.error() << "Mismatch! GPU has extra colored rect point " << point.p
+                            << " on piece " << i << "\n";
+            errors++;
+          }
+        }
+      }
+      for (IndexSpaceIterator<1> it(p_colored_rects_cpu[i]); it.valid; it.step()) {
+        for (PointInRectIterator<1> point(it.rect); point.valid; point.step()) {
+          if(!p_colored_rects[i].contains(point.p)) {
+                log_app.error() << "Mismatch! GPU is missing colored rect point " << point.p
+                                  << " on piece " << i << "\n";
+                errors++;
+          }
+        }
+      }
+      for (IndexSpaceIterator<1> it(p_rects[i]); it.valid; it.step()) {
+        for (PointInRectIterator<1> point(it.rect); point.valid; point.step()) {
+          if (!p_rects_cpu[i].contains(point.p)) {
+            log_app.error() << "Mismatch! GPU has extra rect point " << point.p
+                            << " on piece " << i << "\n";
+            errors++;
+          }
+        }
+      }
+      for (IndexSpaceIterator<1> it(p_rects_cpu[i]); it.valid; it.step()) {
+        for (PointInRectIterator<1> point(it.rect); point.valid; point.step()) {
+          if(!p_rects[i].contains(point.p)) {
+            log_app.error() << "Mismatch! GPU is missing rect point " << point.p
+                            << " on piece " << i << "\n";
+            errors++;
+          }
+        }
+      }
+    }
+    return errors;
   }
 };
 
