@@ -123,9 +123,9 @@ static void top_level_task(const void*, size_t, const void*, size_t, Processor)
 {
   log_app.print() << "deppart_byfield_itest starting";
 
-  // Build the 1D node space [0 .. N-1]
+  // Parent spaces
   IndexSpace<1,int> is_nodes(Rect<1,int>(0, TestConfig::num_nodes - 1));
-  IndexSpace<1,int> is_edges(Rect<1, int>(0, TestConfig::num_edges - 1));
+  IndexSpace<1,int> is_edges(Rect<1,int>(0, TestConfig::num_edges - 1));
 
   // Choose memories
   Memory cpu_mem, gpu_mem;
@@ -140,14 +140,42 @@ static void top_level_task(const void*, size_t, const void*, size_t, Processor)
     log_app.warning() << "No GPU_FB_MEM found; running CPU-only check.";
   }
 
-  // Create CPU instance holding subgraph ids
-  RegionInstance cpu_inst_nodes;
-  make_instance(cpu_inst_nodes, cpu_mem, is_nodes, {sizeof(int)}).wait();
+  // Create equal subspaces - one per piece
+  std::vector<IndexSpace<1,int>> ss_nodes_eq, ss_edges_eq;
+  is_nodes.create_equal_subspaces(TestConfig::num_pieces, 1, ss_nodes_eq,
+                                  ProfilingRequestSet()).wait();
+  is_edges.create_equal_subspaces(TestConfig::num_pieces, 1, ss_edges_eq,
+                                  ProfilingRequestSet()).wait();
 
-  RegionInstance cpu_inst_edges;
-  make_instance(cpu_inst_edges, cpu_mem, is_edges, {sizeof(Point<1, int>), sizeof(Point<1, int>)}).wait();
+  // Per-piece CPU instances
+  std::vector<RegionInstance> cpu_nodes_inst(TestConfig::num_pieces);
+  std::vector<RegionInstance> cpu_edges_inst(TestConfig::num_pieces);
 
-  // Fill ids (deterministic or random)
+  // Per-piece field descriptors
+  std::vector<FieldDataDescriptor<IndexSpace<1,int>, int>>           cpu_nodes(TestConfig::num_pieces);
+  std::vector<FieldDataDescriptor<IndexSpace<1,int>, Point<1,int>>>  cpu_src  (TestConfig::num_pieces);
+  std::vector<FieldDataDescriptor<IndexSpace<1,int>, Point<1,int>>>  cpu_dst  (TestConfig::num_pieces);
+
+  // Allocate + describe per-piece CPU instances
+  for (int i = 0; i < TestConfig::num_pieces; i++) {
+    make_instance(cpu_nodes_inst[i], cpu_mem, ss_nodes_eq[i], {sizeof(int)}).wait();
+    make_instance(cpu_edges_inst[i], cpu_mem, ss_edges_eq[i],
+                  {sizeof(Point<1,int>), sizeof(Point<1,int>)}).wait();
+
+    cpu_nodes[i].index_space  = ss_nodes_eq[i];
+    cpu_nodes[i].inst         = cpu_nodes_inst[i];
+    cpu_nodes[i].field_offset = FID_SUBGRAPH;
+
+    cpu_src[i].index_space    = ss_edges_eq[i];
+    cpu_src[i].inst           = cpu_edges_inst[i];
+    cpu_src[i].field_offset   = FID_SRC;
+
+    cpu_dst[i].index_space    = ss_edges_eq[i];
+    cpu_dst[i].inst           = cpu_edges_inst[i];
+    cpu_dst[i].field_offset   = FID_DST;
+  }
+
+  // Fill ids (deterministic or random) — piecewise
   auto gen_id = [&](Point<1,int> p)->int {
     if (TestConfig::random) {
       return Philox_2x32<>::rand_int(TestConfig::seed,
@@ -159,137 +187,131 @@ static void top_level_task(const void*, size_t, const void*, size_t, Processor)
       return int((long long)p[0] * TestConfig::num_pieces / TestConfig::num_nodes);
     }
   };
-  fill_index_space<1,int,int>(cpu_inst_nodes, FID_SUBGRAPH, is_nodes, gen_id);
-
-  auto gen_src = [&](Point<1,int> p)->Point<1, int> {
+  auto gen_src = [&](Point<1,int> p)->Point<1,int> {
     if (TestConfig::random) {
-      return Point<1, int>(Philox_2x32<>::rand_int(TestConfig::seed,
-                                     /*counter=*/p[0],
-                                     /*stream=*/0,
-                                     /*bound=*/TestConfig::num_nodes));
+      return Point<1,int>(Philox_2x32<>::rand_int(TestConfig::seed,
+                                                  /*counter=*/p[0],
+                                                  /*stream=*/0,
+                                                  /*bound=*/TestConfig::num_nodes));
     } else {
-      return Point<1, int>(p[0] % TestConfig::num_nodes);
+      return Point<1,int>(p[0] % TestConfig::num_nodes);
+    }
+  };
+  auto gen_dst = [&](Point<1,int> p)->Point<1,int> {
+    if (TestConfig::random) {
+      return Point<1,int>(Philox_2x32<>::rand_int(TestConfig::seed,
+                                                  /*counter=*/p[0] + TestConfig::num_edges,
+                                                  /*stream=*/0,
+                                                  /*bound=*/TestConfig::num_nodes));
+    } else {
+      return Point<1,int>((p[0] + 1) % TestConfig::num_nodes);
     }
   };
 
-  fill_index_space<1,int,Point<1,int>>(cpu_inst_edges, FID_SRC, is_edges, gen_src);
-
-  auto gen_dst = [&](Point<1,int> p)->Point<1, int> {
-    if (TestConfig::random) {
-      return Point<1, int>(Philox_2x32<>::rand_int(TestConfig::seed,
-                                     /*counter=*/p[0]+TestConfig::num_edges,
-                                     /*stream=*/0,
-                                     /*bound=*/TestConfig::num_nodes));
-    } else {
-      return Point<1, int>((p[0]+1) % TestConfig::num_nodes);
-    }
-  };
-
-  fill_index_space<1,int,Point<1,int>>(cpu_inst_edges, FID_DST, is_edges, gen_dst);
-
-  if (TestConfig::show) {
-    AffineAccessor<int,1,int> acc(cpu_inst_nodes, FID_SUBGRAPH);
-    for (IndexSpaceIterator<1,int> it(is_nodes); it.valid; it.step())
-      for (PointInRectIterator<1,int> p(it.rect); p.valid; p.step())
-        log_app.print() << "id[" << p.p << "]=" << acc[p.p];
-
-    AffineAccessor<Point<1,int>,1,int> acc_src(cpu_inst_edges, FID_SRC);
-    AffineAccessor<Point<1,int>,1,int> acc_dst(cpu_inst_edges, FID_DST);
-    for (IndexSpaceIterator<1,int> it(is_edges); it.valid; it.step())
-      for (PointInRectIterator<1,int> p(it.rect); p.valid; p.step())
-        log_app.print() << "edge[" << p.p << "]=" << acc_src[p.p] << "->" << acc_dst[p.p];
+  for (int i = 0; i < TestConfig::num_pieces; i++) {
+    fill_index_space<1,int,int>(cpu_nodes_inst[i], FID_SUBGRAPH, ss_nodes_eq[i], gen_id);
+    fill_index_space<1,int,Point<1,int>>(cpu_edges_inst[i], FID_SRC, ss_edges_eq[i], gen_src);
+    fill_index_space<1,int,Point<1,int>>(cpu_edges_inst[i], FID_DST, ss_edges_eq[i], gen_dst);
   }
 
-  // Describe the field data (CPU)
-  FieldDataDescriptor<IndexSpace<1,int>, int> cpu_field_nodes;
-  cpu_field_nodes.index_space  = is_nodes;
-  cpu_field_nodes.inst         = cpu_inst_nodes;
-  cpu_field_nodes.field_offset = 0;
+  if (TestConfig::show) {
+    for (int i = 0; i < TestConfig::num_pieces; i++) {
+      AffineAccessor<int,1,int> acc(cpu_nodes_inst[i], FID_SUBGRAPH);
+      for (IndexSpaceIterator<1,int> it(ss_nodes_eq[i]); it.valid; it.step())
+        for (PointInRectIterator<1,int> p(it.rect); p.valid; p.step())
+          log_app.print() << "id[" << p.p << "]=" << acc[p.p];
 
-  FieldDataDescriptor<IndexSpace<1,int>, Point<1, int>> cpu_field_src;
-  cpu_field_src.index_space  = is_edges;
-  cpu_field_src.inst         = cpu_inst_edges;
-  cpu_field_src.field_offset = 0;
-
-  FieldDataDescriptor<IndexSpace<1,int>, Point<1, int>> cpu_field_dst;
-  cpu_field_dst.index_space  = is_edges;
-  cpu_field_dst.inst         = cpu_inst_edges;
-  cpu_field_dst.field_offset = sizeof(Point<1,int>);
-
-  std::vector<FieldDataDescriptor<IndexSpace<1,int>, int>> cpu_nodes(1, cpu_field_nodes);
-  std::vector<FieldDataDescriptor<IndexSpace<1,int>, Point<1, int>>> cpu_src(1, cpu_field_src);
-  std::vector<FieldDataDescriptor<IndexSpace<1,int>, Point<1, int>>> cpu_dst(1, cpu_field_dst);
-
+      AffineAccessor<Point<1,int>,1,int> acc_src(cpu_edges_inst[i], FID_SRC);
+      AffineAccessor<Point<1,int>,1,int> acc_dst(cpu_edges_inst[i], FID_DST);
+      for (IndexSpaceIterator<1,int> it(ss_edges_eq[i]); it.valid; it.step())
+        for (PointInRectIterator<1,int> p(it.rect); p.valid; p.step())
+          log_app.print() << "edge[" << p.p << "]=" << acc_src[p.p] << "->" << acc_dst[p.p];
+    }
+  }
 
   // Colors 0..num_pieces-1
   std::vector<int> colors(TestConfig::num_pieces);
   for (int i = 0; i < TestConfig::num_pieces; i++) colors[i] = i;
 
-  // CPU partitioning
+  // CPU partitioning (use per-piece descriptors)
   std::vector<IndexSpace<1,int>> p_cpu_nodes, p_cpu_edges, p_cpu_rd;
-  Event e_cpu_byfield = is_nodes.create_subspaces_by_field(cpu_nodes, colors, p_cpu_nodes, ProfilingRequestSet());
-  Event e_cpu_bypreimage = is_edges.create_subspaces_by_preimage(cpu_dst, p_cpu_nodes, p_cpu_edges, ProfilingRequestSet(), e_cpu_byfield);
-  Event e_cpu_image = is_nodes.create_subspaces_by_image(cpu_src, p_cpu_edges, p_cpu_rd, ProfilingRequestSet(), e_cpu_bypreimage);
+  Event e_cpu_byfield   = is_nodes.create_subspaces_by_field(cpu_nodes, colors, p_cpu_nodes,
+                                                             ProfilingRequestSet());
+  Event e_cpu_bypreimg  = is_edges.create_subspaces_by_preimage(cpu_dst, p_cpu_nodes, p_cpu_edges,
+                                                                ProfilingRequestSet(), e_cpu_byfield);
+  Event e_cpu_image     = is_nodes.create_subspaces_by_image(cpu_src, p_cpu_edges, p_cpu_rd,
+                                                             ProfilingRequestSet(), e_cpu_bypreimg);
 
   // GPU path (optional if GPU exists)
   std::vector<IndexSpace<1,int>> p_gpu_nodes, p_gpu_edges, p_gpu_rd;
   if (have_gpu) {
-    RegionInstance gpu_inst_nodes, gpu_inst_edges;
-    make_instance(gpu_inst_nodes, gpu_mem, is_nodes, {sizeof(int)}).wait();
-    make_instance(gpu_inst_edges, gpu_mem, is_edges, {sizeof(Point<1, int>), sizeof(Point<1, int>)}).wait();
+    // Per-piece GPU instances & descriptors
+    std::vector<RegionInstance> gpu_nodes_inst(TestConfig::num_pieces);
+    std::vector<RegionInstance> gpu_edges_inst(TestConfig::num_pieces);
 
-    // Copy field data CPU -> GPU
-    copy_field<1,int,int>(is_nodes, cpu_inst_nodes, gpu_inst_nodes, FID_SUBGRAPH);
-    copy_field<1,int,Point<1,int>>(is_edges, cpu_inst_edges, gpu_inst_edges, FID_SRC);
-    copy_field<1,int,Point<1,int>>(is_edges, cpu_inst_edges, gpu_inst_edges, FID_DST);
+    std::vector<FieldDataDescriptor<IndexSpace<1,int>, int>>          gpu_nodes(TestConfig::num_pieces);
+    std::vector<FieldDataDescriptor<IndexSpace<1,int>, Point<1,int>>> gpu_src  (TestConfig::num_pieces);
+    std::vector<FieldDataDescriptor<IndexSpace<1,int>, Point<1,int>>> gpu_dst  (TestConfig::num_pieces);
 
-    // Describe the field data (CPU)
-    FieldDataDescriptor<IndexSpace<1,int>, int> gpu_field_nodes;
-    gpu_field_nodes.index_space  = is_nodes;
-    gpu_field_nodes.inst         = gpu_inst_nodes;
-    gpu_field_nodes.field_offset = 0;
+    for (int i = 0; i < TestConfig::num_pieces; i++) {
+      make_instance(gpu_nodes_inst[i], gpu_mem, ss_nodes_eq[i], {sizeof(int)}).wait();
+      make_instance(gpu_edges_inst[i], gpu_mem, ss_edges_eq[i],
+                    {sizeof(Point<1,int>), sizeof(Point<1,int>)}).wait();
 
-    FieldDataDescriptor<IndexSpace<1,int>, Point<1, int>> gpu_field_src;
-    gpu_field_src.index_space  = is_edges;
-    gpu_field_src.inst         = gpu_inst_edges;
-    gpu_field_src.field_offset = 0;
+      // Copy CPU -> GPU per subspace
+      copy_field<1,int,int>(ss_nodes_eq[i], cpu_nodes_inst[i], gpu_nodes_inst[i], FID_SUBGRAPH);
+      copy_field<1,int,Point<1,int>>(ss_edges_eq[i], cpu_edges_inst[i], gpu_edges_inst[i], FID_SRC);
+      copy_field<1,int,Point<1,int>>(ss_edges_eq[i], cpu_edges_inst[i], gpu_edges_inst[i], FID_DST);
 
-    FieldDataDescriptor<IndexSpace<1,int>, Point<1, int>> gpu_field_dst;
-    gpu_field_dst.index_space  = is_edges;
-    gpu_field_dst.inst         = cpu_inst_edges;
-    gpu_field_dst.field_offset = sizeof(Point<1,int>);
+      // GPU descriptors
+      gpu_nodes[i].index_space  = ss_nodes_eq[i];
+      gpu_nodes[i].inst         = gpu_nodes_inst[i];
+      gpu_nodes[i].field_offset = FID_SUBGRAPH;
 
-    std::vector<FieldDataDescriptor<IndexSpace<1,int>, int>> gpu_nodes(1, gpu_field_nodes);
-    std::vector<FieldDataDescriptor<IndexSpace<1,int>, Point<1, int>>> gpu_src(1, gpu_field_src);
-    std::vector<FieldDataDescriptor<IndexSpace<1,int>, Point<1, int>>> gpu_dst(1, gpu_field_dst);
+      gpu_src[i].index_space    = ss_edges_eq[i];
+      gpu_src[i].inst           = gpu_edges_inst[i];
+      gpu_src[i].field_offset   = FID_SRC;
 
-    std::vector<IndexSpace<1,int>> p_gpu_nodes, p_gpu_edges, p_gpu_rd;
-    Event e_gpu_byfield = is_nodes.create_subspaces_by_field(gpu_nodes, colors, p_gpu_nodes,
-                                               ProfilingRequestSet());
-    Event e_gpu_bypreimage = is_edges.create_subspaces_by_preimage(gpu_dst, p_gpu_nodes, p_gpu_edges, ProfilingRequestSet(), e_gpu_byfield);
-    Event e_gpu_image = is_nodes.create_subspaces_by_image(gpu_src, p_gpu_edges, p_gpu_rd, ProfilingRequestSet(), e_gpu_bypreimage);
+      gpu_dst[i].index_space    = ss_edges_eq[i];
+      gpu_dst[i].inst           = cpu_edges_inst[i];
+      gpu_dst[i].field_offset   = FID_DST;
+    }
+
+    Event e_gpu_byfield  = is_nodes.create_subspaces_by_field(gpu_nodes, colors, p_gpu_nodes,
+                                                              ProfilingRequestSet());
+    Event e_gpu_bypreimg = is_edges.create_subspaces_by_preimage(gpu_dst, p_gpu_nodes, p_gpu_edges,
+                                                                 ProfilingRequestSet(), e_gpu_byfield);
+    Event e_gpu_image    = is_nodes.create_subspaces_by_image(gpu_src, p_gpu_edges, p_gpu_rd,
+                                                              ProfilingRequestSet(), e_gpu_bypreimg);
 
     e_cpu_image.wait();
     e_gpu_image.wait();
+
     // Compare CPU vs GPU partitions
     if (TestConfig::verify) {
-      int errs = compare_partitions(p_cpu_nodes, p_gpu_nodes) +
-                 compare_partitions(p_cpu_edges, p_gpu_edges) +
-                 compare_partitions(p_cpu_rd, p_gpu_rd);
+      int errs = 0;
+      errs += compare_partitions(p_cpu_nodes, p_gpu_nodes);
+      errs += compare_partitions(p_cpu_edges, p_gpu_edges);
+      errs += compare_partitions(p_cpu_rd,    p_gpu_rd);
       if (errs) {
         log_app.fatal() << "Mismatch between CPU and GPU partitions, errors=" << errs;
         assert(0);
       }
     }
-    gpu_inst_nodes.destroy();
-    gpu_inst_edges.destroy();
+
+    for (int i = 0; i < TestConfig::num_pieces; i++) {
+      gpu_nodes_inst[i].destroy();
+      gpu_edges_inst[i].destroy();
+    }
   } else {
     e_cpu_image.wait();
   }
 
-  // Cleanup
-  cpu_inst_nodes.destroy();
-  cpu_inst_edges.destroy();
+  // Cleanup CPU
+  for (int i = 0; i < TestConfig::num_pieces; i++) {
+    cpu_nodes_inst[i].destroy();
+    cpu_edges_inst[i].destroy();
+  }
   is_nodes.destroy();
   is_edges.destroy();
 

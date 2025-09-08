@@ -429,6 +429,10 @@ if(TEST_USE_GPU)
   set(gpu_deppart_1d_RESOURCE_LOCK gpu)
   add_integration_test(gpu_deppart_1d "${REALM_TEST_DIR}/gpu_deppart_1d.cc")
   target_link_libraries(gpu_deppart_1d ${TEST_GPU_LIBS})
+  set(gpu_deppart_range1d_ARGS -ll:gpu 1)
+  set(gpu_deppart_range1d_RESOURCE_LOCK gpu)
+  add_integration_test(gpu_deppart_range1d "${REALM_TEST_DIR}/gpu_deppart_range1d.cc")
+  target_link_libraries(gpu_deppart_range1d ${TEST_GPU_LIBS})
 endif()
 
 #### C API tests
