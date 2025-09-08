@@ -6,6 +6,13 @@
 
 namespace Realm {
 
+/*
+   *  Input (stored in MicroOp): A list of lists of input index spaces.
+   *  Output: A collapsed list of all rectangles from all the input spaces combined, marked by which input they came from, which are then
+   *  sent off to complete_rect_pipeline.
+   *  Approach: Mark the offsets between input index spaces, copy all the entries from all spaces into a single buffer, then map that buffer
+   *  from entries to marked rectangles in parallel. Finally, call complete_rect_pipeline to finish the job.
+   */
 template <int N, typename T>
 void GPUUnionMicroOp<N, T>::gpu_populate(void) {
   Memory my_mem;
@@ -24,14 +31,11 @@ void GPUUnionMicroOp<N, T>::gpu_populate(void) {
   if (sparsity_outputs.size() == 0) {
      return;
   }
-    nvtx_range_push("cuda", "gpu_union_populate");
+    NVTX_DEPPART(gpu_union);
 
-    cudaStream_t stream;
-    CUDA_CHECK(cudaStreamCreate(&stream), stream);
+    cudaStream_t stream = Cuda::get_task_cuda_stream();
 
-    nvtx_range_push("cuda", "flatten sparsity and inst entries");
-
-    // 1) figure out the final size and build the offsets array
+    // Figure out the final size and build the offsets array
     std::vector<size_t> input_offsets(inputs.size() + 1);
     size_t total_size = 0;
     for (size_t i = 0; i < inputs.size(); ++i) {
@@ -40,18 +44,13 @@ void GPUUnionMicroOp<N, T>::gpu_populate(void) {
         if (inputs[i][j].dense()) {
           total_size += 1;
         } else {
-          // only call get_entries() once per input
           total_size += inputs[i][j].sparsity.impl()->get_entries().size();
         }
       }
     }
-    // final end offset
     input_offsets[inputs.size()] = total_size;
 
-    nvtx_range_pop();
-    nvtx_range_push("cuda", "build device entries");
-
-    // inputs entries allocation
+    // Inputs entries allocation
     RegionInstance inputs_entries_instance = this->realm_malloc(total_size * sizeof(SparsityMapEntry<N,T>), my_mem);
     SparsityMapEntry<N,T>* d_inputs_entries = reinterpret_cast<SparsityMapEntry<N,T>*>(AffineAccessor<char,1>(inputs_entries_instance, 0).base);
 
@@ -61,7 +60,6 @@ void GPUUnionMicroOp<N, T>::gpu_populate(void) {
 
     CUDA_CHECK(cudaMemcpyAsync(d_offsets, input_offsets.data(), (inputs.size()+1) * sizeof(size_t), cudaMemcpyHostToDevice, stream), stream);
 
-    // 3) fill in place
     size_t pos = 0;
     for (size_t i = 0; i < inputs.size(); ++i) {
       for (size_t j = 0; j < inputs[i].size(); j++) {
@@ -88,9 +86,6 @@ void GPUUnionMicroOp<N, T>::gpu_populate(void) {
     union_map_rects<N,T><<<grid_size, threads_per_block, 0, stream>>>(d_inputs_entries, d_offsets, total_size, inputs.size(), d_output_rects);
     KERNEL_CHECK(stream);
 
-    CUDA_CHECK(cudaStreamSynchronize(stream), stream);
-    cudaStreamDestroy(stream);
-
 
     this->complete_rect_pipeline(d_output_rects, total_size, my_mem,
     /* the Container: */  sparsity_outputs,
@@ -102,9 +97,6 @@ void GPUUnionMicroOp<N, T>::gpu_populate(void) {
                           // return the SparsityMap key itself
                           return elem;
                        });
-
-  nvtx_range_pop();
-  nvtx_range_pop();
 
 }
 

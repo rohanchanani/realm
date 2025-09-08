@@ -4,6 +4,9 @@
 
 namespace Realm {
 
+  // Given a combined buffer of sparsity map entries and the offsets
+  // of input within that buffer, converts the entries to rectangles
+  // and marks them with which rectangle they came from.
   template <int N, typename T>
   __global__
   void union_map_rects(const SparsityMapEntry<N,T>* d_in,
