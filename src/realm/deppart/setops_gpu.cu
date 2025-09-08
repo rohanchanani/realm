@@ -126,14 +126,10 @@ void GPUUnionMicroOp<N, T>::gpu_populate(void) {
     if (sparsity_outputs.size() == 0) {
        return;
     }
-      nvtx_range_push("cuda", "gpu_intersection_populate");
+      NVTX_DEPPART(gpu_intersection_single);
 
-      cudaStream_t stream;
-      CUDA_CHECK(cudaStreamCreate(&stream), stream);
+      cudaStream_t stream = Cuda::get_task_cuda_stream();
 
-      nvtx_range_push("cuda", "flatten sparsity and inst entries");
-
-      // 1) figure out the final size and build the offsets array
       size_t lhs_size = inputs[0][0].dense() ? 1 : inputs[0][0].sparsity.impl()->get_entries().size();
 
       // inputs entries allocation
@@ -293,10 +289,6 @@ void GPUUnionMicroOp<N, T>::gpu_populate(void) {
           uint32_t num_valid_rects = h_input_counters[inputs.size()];
 
           if (num_valid_rects==0) {
-            CUDA_CHECK(cudaStreamSynchronize(stream), stream);
-            cudaStreamDestroy(stream);
-            nvtx_range_pop();
-            nvtx_range_pop();
             morton_codes_instance.destroy();
             indices_instance.destroy();
             rhs_indices_instance.destroy();
@@ -371,9 +363,6 @@ void GPUUnionMicroOp<N, T>::gpu_populate(void) {
                             return elem;
                          });
 
-    nvtx_range_pop();
-    nvtx_range_pop();
-    CUDA_CHECK(cudaStreamDestroy(stream), stream);
     lhs_entries_instance.destroy();
     lhs_rects_instance.destroy();
   }
@@ -396,12 +385,9 @@ void GPUIntersectionMicroOp<N, T>::gpu_populate_multiple(void) {
   if (sparsity_outputs.size() == 0) {
      return;
   }
-    nvtx_range_push("cuda", "gpu_intersection_populate");
+    NVTX_DEPPART(gpu_intersection_multiple);
 
-    cudaStream_t stream;
-    CUDA_CHECK(cudaStreamCreate(&stream), stream);
-
-    nvtx_range_push("cuda", "flatten sparsity and inst entries");
+    cudaStream_t stream = Cuda::get_task_cuda_stream();
 
     // 1) figure out the final size and build the offsets array
     std::vector<size_t> lhs_offsets(inputs.size() + 1);
@@ -427,9 +413,6 @@ void GPUIntersectionMicroOp<N, T>::gpu_populate_multiple(void) {
     // final end offset
     lhs_offsets[inputs.size()] = lhs_size;
     rhs_offsets[inputs.size()] = rhs_size;
-
-    nvtx_range_pop();
-    nvtx_range_push("cuda", "build device entries");
 
     // inputs entries allocation
     RegionInstance lhs_entries_instance = this->realm_malloc(lhs_size * sizeof(SparsityMapEntry<N,T>), my_mem);
@@ -610,7 +593,6 @@ void GPUIntersectionMicroOp<N, T>::gpu_populate_multiple(void) {
       uint32_t num_valid_rects = h_input_counters[inputs.size()];
 
       if (num_valid_rects==0) {
-        CUDA_CHECK(cudaStreamSynchronize(stream), stream);
         for (auto it : sparsity_outputs) {
           SparsityMapImpl<N, T> *impl = SparsityMapImpl<N, T>::lookup(it);
           impl->gpu_finalize();
@@ -633,9 +615,6 @@ void GPUIntersectionMicroOp<N, T>::gpu_populate_multiple(void) {
         offsets_instance.destroy();
         output_rects_instance.destroy();
         global_bounds_instance.destroy();
-        nvtx_range_pop();
-        nvtx_range_pop();
-        cudaStreamDestroy(stream);
         return;
       }
 
@@ -678,16 +657,12 @@ void GPUIntersectionMicroOp<N, T>::gpu_populate_multiple(void) {
                           return elem;
                        });
 
-  CUDA_CHECK(cudaStreamDestroy(stream), stream);
   lhs_entries_instance.destroy();
   rhs_entries_instance.destroy();
   offsets_instance.destroy();
   output_rects_instance.destroy();
   global_bounds_instance.destroy();
   output_instance.destroy();
-
-  nvtx_range_pop();
-  nvtx_range_pop();
 
 }
 
