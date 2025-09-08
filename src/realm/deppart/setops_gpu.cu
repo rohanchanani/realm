@@ -377,12 +377,9 @@ void GPUDifferenceMicroOp<N, T>::gpu_populate(void) {
   if (sparsity_outputs.size() == 0) {
      return;
   }
-    nvtx_range_push("cuda", "gpu_difference_populate");
 
-    cudaStream_t stream;
-    CUDA_CHECK(cudaStreamCreate(&stream), stream);
-
-    nvtx_range_push("cuda", "flatten sparsity and inst entries");
+    cudaStream_t stream = Cuda::get_task_cuda_stream();
+    NVTX_DEPPART(gpu_difference);
 
     // 1) figure out the final size and build the offsets array
     std::vector<size_t> lhs_offsets(lhss.size() + 1);
@@ -409,8 +406,6 @@ void GPUDifferenceMicroOp<N, T>::gpu_populate(void) {
     lhs_offsets[lhss.size()] = lhs_size;
     rhs_offsets[rhss.size()] = rhs_size;
 
-    nvtx_range_pop();
-    nvtx_range_push("cuda", "build device entries");
 
     // inputs entries allocation
     RegionInstance lhs_entries_instance = this->realm_malloc(lhs_size * sizeof(SparsityMapEntry<N,T>), my_mem);
@@ -641,7 +636,6 @@ void GPUDifferenceMicroOp<N, T>::gpu_populate(void) {
       num_frags += last_frag;
 
       if (num_hits==0) {
-        CUDA_CHECK(cudaStreamSynchronize(stream), stream);
         morton_codes_instance.destroy();
         indices_instance.destroy();
         rhs_indices_instance.destroy();
@@ -670,16 +664,11 @@ void GPUDifferenceMicroOp<N, T>::gpu_populate(void) {
                         // return the SparsityMap key itself
                         return elem;
                      });
-
-        CUDA_CHECK(cudaStreamDestroy(stream), stream);
         lhs_entries_instance.destroy();
         rhs_entries_instance.destroy();
         offsets_instance.destroy();
         output_rects_instance.destroy();
         global_bounds_instance.destroy();
-
-        nvtx_range_pop();
-        nvtx_range_pop();
         return;
       }
 
@@ -791,7 +780,6 @@ void GPUDifferenceMicroOp<N, T>::gpu_populate(void) {
       }
 
       if (num_valid_rects==0) {
-        CUDA_CHECK(cudaStreamSynchronize(stream), stream);
         for (auto it : sparsity_outputs) {
           SparsityMapImpl<N, T> *impl = SparsityMapImpl<N, T>::lookup(it);
           impl->gpu_finalize();
@@ -819,9 +807,6 @@ void GPUDifferenceMicroOp<N, T>::gpu_populate(void) {
         offsets_instance.destroy();
         output_rects_instance.destroy();
         global_bounds_instance.destroy();
-        nvtx_range_pop();
-        nvtx_range_pop();
-        cudaStreamDestroy(stream);
         return;
       }
       CUDA_CHECK(cudaStreamSynchronize(stream), stream);
@@ -854,17 +839,12 @@ void GPUDifferenceMicroOp<N, T>::gpu_populate(void) {
                           // return the SparsityMap key itself
                           return elem;
                        });
-
-  CUDA_CHECK(cudaStreamDestroy(stream), stream);
   lhs_entries_instance.destroy();
   rhs_entries_instance.destroy();
   offsets_instance.destroy();
   output_rects_instance.destroy();
   global_bounds_instance.destroy();
   frags_instance.destroy();
-
-  nvtx_range_pop();
-  nvtx_range_pop();
 
 }
 
