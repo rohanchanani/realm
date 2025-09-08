@@ -234,16 +234,19 @@ static void top_level_task(const void*, size_t, const void*, size_t, Processor)
   for (int i = 0; i < TestConfig::num_pieces; i++) colors[i] = i;
 
   // CPU partitioning (use per-piece descriptors)
-  std::vector<IndexSpace<1,int>> p_cpu_nodes, p_cpu_edges, p_cpu_rd;
+  std::vector<IndexSpace<1,int>> p_cpu_nodes, p_cpu_edges, p_cpu_rd, p_cpu_preimage2;
   Event e_cpu_byfield   = is_nodes.create_subspaces_by_field(cpu_nodes, colors, p_cpu_nodes,
                                                              ProfilingRequestSet());
   Event e_cpu_bypreimg  = is_edges.create_subspaces_by_preimage(cpu_dst, p_cpu_nodes, p_cpu_edges,
                                                                 ProfilingRequestSet(), e_cpu_byfield);
   Event e_cpu_image     = is_nodes.create_subspaces_by_image(cpu_src, p_cpu_edges, p_cpu_rd,
                                                              ProfilingRequestSet(), e_cpu_bypreimg);
+  // NEW: second preimage (edges by dst over p_cpu_rd)
+  Event e_cpu_bypreimg2 = is_edges.create_subspaces_by_preimage(cpu_dst, p_cpu_rd, p_cpu_preimage2,
+                                                                ProfilingRequestSet(), e_cpu_image);
 
   // GPU path (optional if GPU exists)
-  std::vector<IndexSpace<1,int>> p_gpu_nodes, p_gpu_edges, p_gpu_rd;
+  std::vector<IndexSpace<1,int>> p_gpu_nodes, p_gpu_edges, p_gpu_rd, p_gpu_preimage2;
   if (have_gpu) {
     // Per-piece GPU instances & descriptors
     std::vector<RegionInstance> gpu_nodes_inst(TestConfig::num_pieces);
@@ -273,7 +276,7 @@ static void top_level_task(const void*, size_t, const void*, size_t, Processor)
       gpu_src[i].field_offset   = FID_SRC;
 
       gpu_dst[i].index_space    = ss_edges_eq[i];
-      gpu_dst[i].inst           = cpu_edges_inst[i];
+      gpu_dst[i].inst           = gpu_edges_inst[i];
       gpu_dst[i].field_offset   = FID_DST;
     }
 
@@ -283,16 +286,20 @@ static void top_level_task(const void*, size_t, const void*, size_t, Processor)
                                                                  ProfilingRequestSet(), e_gpu_byfield);
     Event e_gpu_image    = is_nodes.create_subspaces_by_image(gpu_src, p_gpu_edges, p_gpu_rd,
                                                               ProfilingRequestSet(), e_gpu_bypreimg);
+    // NEW: second preimage (edges by dst over p_gpu_rd)
+    Event e_gpu_bypreimg2 = is_edges.create_subspaces_by_preimage(gpu_dst, p_gpu_rd, p_gpu_preimage2,
+                                                                  ProfilingRequestSet(), e_gpu_image);
 
-    e_cpu_image.wait();
-    e_gpu_image.wait();
+    e_cpu_bypreimg2.wait();
+    e_gpu_bypreimg2.wait();
 
-    // Compare CPU vs GPU partitions
+    // Compare CPU vs GPU partitions (including second preimage)
     if (TestConfig::verify) {
       int errs = 0;
-      errs += compare_partitions(p_cpu_nodes, p_gpu_nodes);
-      errs += compare_partitions(p_cpu_edges, p_gpu_edges);
-      errs += compare_partitions(p_cpu_rd,    p_gpu_rd);
+      errs += compare_partitions(p_cpu_nodes,      p_gpu_nodes);
+      errs += compare_partitions(p_cpu_edges,      p_gpu_edges);
+      errs += compare_partitions(p_cpu_rd,         p_gpu_rd);
+      errs += compare_partitions(p_cpu_preimage2,  p_gpu_preimage2); // NEW check
       if (errs) {
         log_app.fatal() << "Mismatch between CPU and GPU partitions, errors=" << errs;
         assert(0);
@@ -304,7 +311,7 @@ static void top_level_task(const void*, size_t, const void*, size_t, Processor)
       gpu_edges_inst[i].destroy();
     }
   } else {
-    e_cpu_image.wait();
+    e_cpu_bypreimg2.wait();
   }
 
   // Cleanup CPU
@@ -347,3 +354,4 @@ int main(int argc, char** argv)
   rt.wait_for_shutdown();
   return 0;
 }
+

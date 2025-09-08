@@ -110,12 +110,7 @@ namespace Realm {
       h_inst_counters[i+1] += h_inst_counters[i];
     }
 
-    size_t big_inst_counters[domain_transform.range_data.size()+1];
-    for (size_t i = 0; i < domain_transform.range_data.size()+1; ++i) {
-      big_inst_counters[i] = h_inst_counters[i];
-    }
-
-    size_t num_valid_rects = big_inst_counters[domain_transform.range_data.size()];
+    size_t num_valid_rects = h_inst_counters[domain_transform.range_data.size()];
 
     if (num_valid_rects == 0) {
       CUDA_CHECK(cudaStreamSynchronize(stream), stream);
@@ -129,9 +124,9 @@ namespace Realm {
       return;
     }
 
-    RegionInstance inst_prefix_instance = this->realm_malloc((domain_transform.range_data.size() + 1) * sizeof(size_t), my_mem);
-    size_t* d_inst_prefix = reinterpret_cast<size_t*>(AffineAccessor<char,1>(inst_prefix_instance, 0).base);
-    CUDA_CHECK(cudaMemcpyAsync(d_inst_prefix, big_inst_counters, (domain_transform.range_data.size() + 1) * sizeof(size_t), cudaMemcpyHostToDevice, stream), stream);
+    RegionInstance inst_prefix_instance = this->realm_malloc((domain_transform.range_data.size() + 1) * sizeof(uint32_t), my_mem);
+    uint32_t* d_inst_prefix = reinterpret_cast<uint32_t*>(AffineAccessor<char,1>(inst_prefix_instance, 0).base);
+    CUDA_CHECK(cudaMemcpyAsync(d_inst_prefix, h_inst_counters, (domain_transform.range_data.size() + 1) * sizeof(uint32_t), cudaMemcpyHostToDevice, stream), stream);
 
     RegionInstance valid_rects_instance = this->realm_malloc(num_valid_rects * sizeof(Rect<N,T>), my_mem);
     Rect<N,T>* d_valid_rects = reinterpret_cast<Rect<N,T>*>(AffineAccessor<char,1>(valid_rects_instance, 0).base);
@@ -591,12 +586,7 @@ namespace Realm {
       h_inst_counters[i+1] += h_inst_counters[i];
     }
 
-    size_t big_inst_counters[domain_transform.ptr_data.size()+1];
-    for (size_t i = 0; i < domain_transform.ptr_data.size()+1; ++i) {
-      big_inst_counters[i] = h_inst_counters[i];
-    }
-
-    size_t num_valid_rects = big_inst_counters[domain_transform.ptr_data.size()];
+    size_t num_valid_rects = h_inst_counters[domain_transform.ptr_data.size()];
 
     if (num_valid_rects == 0) {
       CUDA_CHECK(cudaStreamSynchronize(stream), stream);
@@ -610,9 +600,9 @@ namespace Realm {
       return;
     }
 
-    RegionInstance inst_prefix_instance = this->realm_malloc((domain_transform.ptr_data.size() + 1) * sizeof(size_t), my_mem);
-    size_t* d_inst_prefix = reinterpret_cast<size_t*>(AffineAccessor<char,1>(inst_prefix_instance, 0).base);
-    CUDA_CHECK(cudaMemcpyAsync(d_inst_prefix, big_inst_counters, (domain_transform.ptr_data.size() + 1) * sizeof(size_t), cudaMemcpyHostToDevice, stream), stream);
+    RegionInstance inst_prefix_instance = this->realm_malloc((domain_transform.ptr_data.size() + 1) * sizeof(uint32_t), my_mem);
+    uint32_t* d_inst_prefix = reinterpret_cast<uint32_t*>(AffineAccessor<char,1>(inst_prefix_instance, 0).base);
+    CUDA_CHECK(cudaMemcpyAsync(d_inst_prefix, h_inst_counters, (domain_transform.ptr_data.size() + 1) * sizeof(uint32_t), cudaMemcpyHostToDevice, stream), stream);
 
     RegionInstance valid_rects_instance = this->realm_malloc(num_valid_rects * sizeof(Rect<N,T>), my_mem);
     Rect<N,T>* d_valid_rects = reinterpret_cast<Rect<N,T>*>(AffineAccessor<char,1>(valid_rects_instance, 0).base);
