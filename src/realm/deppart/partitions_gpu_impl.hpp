@@ -108,6 +108,7 @@ namespace Realm {
 
     // Determine size of allocation for combined rects.
     out_space.num_entries = 0;
+    out_space.bounds = Rect<N,T>::make_empty();
 
     for (size_t i = 0; i < spaces.size(); ++i) {
       space_offsets[i] = out_space.num_entries;
@@ -122,6 +123,7 @@ namespace Realm {
       } else {
         out_space.num_entries += my_space.sparsity.impl()->get_entries().size();
       }
+      out_space.bounds = out_space.bounds.union_bbox(my_space.bounds);
     }
     space_offsets[spaces.size()] = out_space.num_entries;
 
@@ -206,6 +208,8 @@ namespace Realm {
 
       size_t total_instance_size = indices_instance_size + labels_instance_size + boxes_instance_size + 2 * child_instance_size;
       bvh_instance = realm_malloc(total_instance_size, my_mem);
+
+      result.num_leaves = space.num_entries;
 
       size_t curr_idx = 0;
       result.indices = reinterpret_cast<uint64_t*>(AffineAccessor<char,1>(bvh_instance, 0).base + curr_idx);
