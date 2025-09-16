@@ -55,7 +55,7 @@ __device__ void preimage_queryBVH(
     const int*      childRight,
     const uint64_t* leafIdx,
     const size_t*   targets_indices,
-    int*            root,
+    int            root,
     size_t          numTargetRects,
     const Q&        in_query,
     Point<N, T> out_point,
@@ -69,7 +69,7 @@ __device__ void preimage_queryBVH(
 
   // start at the root
   stack[sp++] = -1;
-  int node = *root;
+  int node = root;
   do
   {
 
@@ -140,7 +140,7 @@ void preimage_gpuPopulateBitmasksPtrsKernel(
   Rect<N,T>* rects,
   size_t* prefix,
   uint32_t* inst_offsets,
-  int *root,
+  int root,
   int *childLeft,
   int *childRight,
   uint64_t *indices,

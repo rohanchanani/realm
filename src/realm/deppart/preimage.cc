@@ -323,20 +323,30 @@ namespace Realm {
 
 	template<int N, typename T, int N2, typename T2>
 	void PreimageOperation<N, T, N2, T2>::execute(void) {
-		if ((domain_transform.ptr_data.size() > 0 && domain_transform.ptr_data[0].inst.get_location().kind() ==
-		Memory::GPU_FB_MEM) || (domain_transform.range_data.size() > 0 && domain_transform.range_data[0].inst.get_location().kind() ==
-                Memory::GPU_FB_MEM)) {
-
-			GPUPreimageMicroOp<N, T, N2, T2> *micro_op =
-					new GPUPreimageMicroOp<N, T, N2, T2>(
-						domain_transform, parent);
-
-			for (size_t j = 0; j < targets.size(); j++) {
-				micro_op->add_sparsity_output(targets[j], preimages[j]);
-			}
-			micro_op->dispatch(this, true);
-		} else if (domain_transform.type ==
-		           DomainTransform<N2, T2, N, T>::DomainTransformType::STRUCTURED) {
+		std::vector<FieldDataDescriptor<IndexSpace<N,T>,Point<N2, T2>> > gpu_ptr_data;
+		std::vector<FieldDataDescriptor<IndexSpace<N,T>,Point<N2, T2>> > cpu_ptr_data;
+		std::vector<FieldDataDescriptor<IndexSpace<N,T>,Rect<N2, T2>> > gpu_rect_data;
+		std::vector<FieldDataDescriptor<IndexSpace<N,T>,Rect<N2, T2>> > cpu_rect_data;
+		for (size_t i = 0; i < domain_transform.ptr_data.size(); i++) {
+			if (domain_transform.ptr_data[i].inst.get_location().kind() ==
+			    Memory::GPU_FB_MEM) {
+				gpu_ptr_data.push_back(domain_transform.ptr_data[i]);
+			    } else {
+			    	cpu_ptr_data.push_back(domain_transform.ptr_data[i]);
+			    }
+		}
+		for (size_t i = 0; i < domain_transform.range_data.size(); i++) {
+			if (domain_transform.range_data[i].inst.get_location().kind() ==
+			    Memory::GPU_FB_MEM) {
+				gpu_rect_data.push_back(domain_transform.range_data[i]);
+			    } else {
+			    	cpu_rect_data.push_back(domain_transform.range_data[i]);
+			    }
+		}
+		bool gpu_data = !gpu_ptr_data.empty() || !gpu_rect_data.empty();
+		bool cpu_data = !cpu_ptr_data.empty() || !cpu_rect_data.empty();
+		if (domain_transform.type ==
+		           DomainTransform<N2, T2, N, T>::DomainTransformType::STRUCTURED && !gpu_data) {
 			for (size_t i = 0; i < preimages.size(); i++) {
 				SparsityMapImpl<N, T>::lookup(preimages[i])->set_contributor_count(1);
 			}
@@ -349,8 +359,7 @@ namespace Realm {
 				micro_op->add_sparsity_output(targets[j], preimages[j]);
 			}
 			micro_op->dispatch(this, true);
-		} else {
-			if (!DeppartConfig::cfg_disable_intersection_optimization) {
+		} else if (!DeppartConfig::cfg_disable_intersection_optimization && !gpu_data) {
 				// build the overlap tester based on the targets, since they're at least
 				// known
 				ComputeOverlapMicroOp<N2, T2> *uop =
@@ -398,30 +407,41 @@ namespace Realm {
 				}
 
 				uop->dispatch(this, true /* ok to run in this thread */);
-			} else {
+		} else {
+			if (cpu_data) {
 				for (size_t i = 0; i < preimages.size(); i++)
 					SparsityMapImpl<N, T>::lookup(preimages[i])
-							->set_contributor_count(domain_transform.ptr_data.size() +
-							                        domain_transform.range_data.size());
-
-				for (size_t i = 0; i < domain_transform.ptr_data.size(); i++) {
+							->set_contributor_count(cpu_ptr_data.size() +
+										cpu_rect_data.size() + (gpu_data ? 1 : 0));
+				for (size_t i = 0; i < cpu_ptr_data.size(); i++) {
 					PreimageMicroOp<N, T, N2, T2> *uop = new PreimageMicroOp<N, T, N2, T2>(
-						parent, domain_transform.ptr_data[i].index_space,
-						domain_transform.ptr_data[i].inst,
-						domain_transform.ptr_data[i].field_offset, false /*ptrs*/);
+						parent, cpu_ptr_data[i].index_space,
+						cpu_ptr_data[i].inst,
+						cpu_ptr_data[i].field_offset, false /*ptrs*/);
 					for (size_t j = 0; j < targets.size(); j++)
 						uop->add_sparsity_output(targets[j], preimages[j]);
 					uop->dispatch(this, true /* ok to run in this thread */);
 				}
-				for (size_t i = 0; i < domain_transform.range_data.size(); i++) {
+				for (size_t i = 0; i < cpu_rect_data.size(); i++) {
 					PreimageMicroOp<N, T, N2, T2> *uop = new PreimageMicroOp<N, T, N2, T2>(
-						parent, domain_transform.range_data[i].index_space,
-						domain_transform.range_data[i].inst,
-						domain_transform.range_data[i].field_offset, true /*ranges*/);
+						parent, cpu_rect_data[i].index_space,
+						cpu_rect_data[i].inst,
+						cpu_rect_data[i].field_offset, true /*ranges*/);
 					for (size_t j = 0; j < targets.size(); j++)
 						uop->add_sparsity_output(targets[j], preimages[j]);
 					uop->dispatch(this, true /* ok to run in this thread */);
 				}
+			}
+			if (gpu_data) {
+				std::swap(domain_transform.ptr_data, gpu_ptr_data);
+				std::swap(domain_transform.range_data, gpu_rect_data);
+				GPUPreimageMicroOp<N, T, N2, T2> *micro_op =
+				   new GPUPreimageMicroOp<N, T, N2, T2>(
+				     domain_transform, parent, !cpu_data);
+				for (size_t j = 0; j < targets.size(); j++) {
+					micro_op->add_sparsity_output(targets[j], preimages[j]);
+				}
+				micro_op->dispatch(this, true);
 			}
 		}
 	}
@@ -705,8 +725,9 @@ namespace Realm {
 	template<int N, typename T, int N2, typename T2>
 	GPUPreimageMicroOp<N, T, N2, T2>::GPUPreimageMicroOp(
 		const DomainTransform<N2, T2, N, T> &_domain_transform,
-		IndexSpace<N, T> _parent_space)
+		IndexSpace<N, T> _parent_space, bool _exclusive)
 		: domain_transform(_domain_transform), parent_space(_parent_space) {
+		this->exclusive = _exclusive;
 	}
 
 	template<int N, typename T, int N2, typename T2>

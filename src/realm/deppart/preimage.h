@@ -162,7 +162,7 @@ namespace Realm {
     typedef T2 IDXTYPE2;
 
     GPUPreimageMicroOp(const DomainTransform<N2, T2, N, T> &_domain_transform,
-                              IndexSpace<N, T> _parent_space);
+                              IndexSpace<N, T> _parent_space, bool _exclusive);
 
     virtual ~GPUPreimageMicroOp(void);
 
