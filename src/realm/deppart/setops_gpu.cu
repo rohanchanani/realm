@@ -54,6 +54,13 @@ void GPUUnionMicroOp<N, T>::gpu_populate(void) {
     RegionInstance inputs_entries_instance = this->realm_malloc(total_size * sizeof(SparsityMapEntry<N,T>), my_mem);
     SparsityMapEntry<N,T>* d_inputs_entries = reinterpret_cast<SparsityMapEntry<N,T>*>(AffineAccessor<char,1>(inputs_entries_instance, 0).base);
 
+    //We copy into one contiguous host buffer, then copy to device
+    Memory sysmem;
+    assert(find_memory(sysmem, Memory::SYSTEM_MEM));
+
+    RegionInstance h_instance = this->realm_malloc(total_size * sizeof(SparsityMapEntry<N,T>), sysmem);
+    SparsityMapEntry<N, T>* h_entries = reinterpret_cast<SparsityMapEntry<N,T>*>(AffineAccessor<char,1>(h_instance, 0).base);
+
     // Offsets allocation
     RegionInstance offsets_instance = this->realm_malloc((inputs.size()+1) * sizeof(size_t), my_mem);
     size_t* d_offsets = reinterpret_cast<size_t*>(AffineAccessor<char,1>(offsets_instance, 0).base);
@@ -67,23 +74,22 @@ void GPUUnionMicroOp<N, T>::gpu_populate(void) {
           // just one rect
           SparsityMapEntry<N,T> entry;
           entry.bounds = inputs[i][j].bounds;
-          CUDA_CHECK(cudaMemcpyAsync(d_inputs_entries + pos, &entry, sizeof(SparsityMapEntry<N,T>), cudaMemcpyHostToDevice, stream), stream);
+          memcpy(h_entries + pos, &entry, sizeof(SparsityMapEntry<N,T>));
           ++pos;
         } else {
             auto& tmp = inputs[i][j].sparsity.impl()->get_entries();
-            CUDA_CHECK(cudaMemcpyAsync(d_inputs_entries + pos, tmp.data(), tmp.size() * sizeof(SparsityMapEntry<N,T>), cudaMemcpyHostToDevice, stream), stream);
+            memcpy(h_entries + pos, tmp.data(), tmp.size() * sizeof(SparsityMapEntry<N,T>));
             pos += tmp.size();
         }
       }
     }
 
+    CUDA_CHECK(cudaMemcpyAsync(d_inputs_entries, h_entries, total_size * sizeof(SparsityMapEntry<N,T>), cudaMemcpyHostToDevice, stream), stream);
+
     RegionInstance output_rects_instance = this->realm_malloc(total_size * sizeof(RectDesc<N,T>), my_mem);
     RectDesc<N, T>* d_output_rects = reinterpret_cast<RectDesc<N,T>*>(AffineAccessor<char,1>(output_rects_instance, 0).base);
 
-    int threads_per_block = 256;
-    int grid_size = (total_size + threads_per_block - 1) / threads_per_block;
-
-    union_map_rects<N,T><<<grid_size, threads_per_block, 0, stream>>>(d_inputs_entries, d_offsets, total_size, inputs.size(), d_output_rects);
+    union_map_rects<N,T><<<COMPUTE_GRID(total_size), THREADS_PER_BLOCK, 0, stream>>>(d_inputs_entries, d_offsets, total_size, inputs.size(), d_output_rects);
     KERNEL_CHECK(stream);
 
 
