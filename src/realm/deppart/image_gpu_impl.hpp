@@ -115,10 +115,10 @@ void GPUImageMicroOp<N,T,N2,T2>::gpu_populate_rngs()
 
     Memory zcpy_mem;
     assert(find_memory(zcpy_mem, Memory::Z_COPY_MEM));
-    RegionInstance accessors_instance = this->realm_malloc(domain_transform.ptr_data.size() * sizeof(AffineAccessor<Rect<N,T>,N2,T2>), zcpy_mem);
+    RegionInstance accessors_instance = this->realm_malloc(domain_transform.range_data.size() * sizeof(AffineAccessor<Rect<N,T>,N2,T2>), zcpy_mem);
     AffineAccessor<Rect<N,T>,N2,T2>* d_accessors = reinterpret_cast<AffineAccessor<Rect<N,T>,N2,T2>*>(AffineAccessor<char,1>(accessors_instance, 0).base);
-    for (size_t i = 0; i < domain_transform.ptr_data.size(); ++i) {
-      d_accessors[i] = AffineAccessor<Rect<N,T>,N2,T2>(domain_transform.ptr_data[i].inst, domain_transform.ptr_data[i].field_offset);
+    for (size_t i = 0; i < domain_transform.range_data.size(); ++i) {
+      d_accessors[i] = AffineAccessor<Rect<N,T>,N2,T2>(domain_transform.range_data[i].inst, domain_transform.range_data[i].field_offset);
     }
 
     image_gpuPopulateBitmasksRngsKernel<N,T,N2,T2><<<COMPUTE_GRID(total_pts), THREADS_PER_BLOCK, 0, stream>>>(d_accessors, d_valid_rects, d_prefix_rects, d_inst_prefix, total_pts, num_valid_rects, domain_transform.range_data.size(), d_rngs);
