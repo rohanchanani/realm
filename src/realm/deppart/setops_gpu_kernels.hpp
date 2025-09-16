@@ -203,7 +203,7 @@ __device__ inline void subtract_one_frag(const RectDesc<N, T> &R, const Rect<N, 
 
 template <int N, typename T>
 __global__ void
-difference_count_hits(RectDesc<N, T> *queries, int *root, int *childLeft, int *childRight,
+difference_count_hits(RectDesc<N, T> *queries, int root, int *childLeft, int *childRight,
                       uint64_t *leafIdx, uint64_t *targets_indices, uint32_t* d_hits_prefix, Rect<N, T> *boxes,
                       size_t numQueries, size_t numBoxes, uint32_t *d_hit_counts, uint32_t *d_frag_counts, Rect<N, T> *d_hits)
 {
@@ -221,7 +221,7 @@ difference_count_hits(RectDesc<N, T> *queries, int *root, int *childLeft, int *c
   int stack[MAX_STACK];
   int sp = 0;
   stack[sp++] = -1;
-  int node = *root;
+  int node = root;
 
   while(node != -1) {
     const int L = childLeft[node];
