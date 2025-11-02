@@ -52,13 +52,15 @@ void GPUByFieldMicroOp<N,T,FT>::execute()
   // to track which instance each rectangle came from in the populate phase.
   uint32_t* d_inst_prefix = d_inst_counters + field_data.size();
   RegionInstance out_instance;
-  size_t num_valid_rects;
+  size_t num_valid_rects = 0;
 
   // Here we intersect the instance spaces with the parent space, and make sure we know which instance each resulting rectangle came from.
   GPUMicroOp<N, T>::template construct_input_rectlist<Rect<N, T>>(inst_space, collapsed_parent, out_instance, num_valid_rects, d_inst_counters, d_inst_prefix, my_mem, stream);
   inst_entries_instance.destroy();
   parent_entries_instance.destroy();
   inst_offsets_instance.destroy();
+
+  std::cout << "ByField GPU found " << num_valid_rects << " valid rectangles." << std::endl;
 
   // Early out if we don't have any rectangles.
   if (num_valid_rects == 0) {
@@ -76,6 +78,8 @@ void GPUByFieldMicroOp<N,T,FT>::execute()
 
   Rect<N, T>* d_valid_rects = reinterpret_cast<Rect<N,T>*>(AffineAccessor<char,1>(out_instance, 0).base);
 
+  std::cout << "ByField GPU proceeding to populate " << num_valid_rects << " rectangles." << std::endl;
+
   // Prefix sum the valid rectangles by volume.
   RegionInstance prefix_rects_instance;
   size_t total_pts;
@@ -90,6 +94,8 @@ void GPUByFieldMicroOp<N,T,FT>::execute()
 
   FT* d_colors;
   RegionInstance colors_instance;
+
+  std::cout << "ByField GPU populating " << total_pts << " points." <<  std::endl;
 
   // Memcpying a boolean vector breaks things for some reason so we have this disgusting workaround.
   if constexpr(std::is_same_v<FT,bool>) {
@@ -107,6 +113,8 @@ void GPUByFieldMicroOp<N,T,FT>::execute()
     CUDA_CHECK(cudaMemcpyAsync(d_colors, colors.data(), colors.size() * sizeof(FT), cudaMemcpyHostToDevice, stream), stream);
   }
 
+  std::cout << "ByField GPU copied colors." << std::endl;
+
   Memory zcpy_mem;
   assert(find_memory(zcpy_mem, Memory::Z_COPY_MEM));
 
@@ -117,10 +125,14 @@ void GPUByFieldMicroOp<N,T,FT>::execute()
     d_accessors[i] = AffineAccessor<FT,N,T>(field_data[i].inst, field_data[i].field_offset);
   }
 
+  std::cout << "ByField GPU copied accessors." << std::endl;
+
 
   // This is where the work is actually done - each thread figures out which points to read, reads it, marks a PointDesc with its color, and writes it out.
   byfield_gpuPopulateBitmasksKernel<N,T,FT><<<COMPUTE_GRID(total_pts), THREADS_PER_BLOCK, 0, stream>>>(d_accessors, d_valid_rects, d_prefix_rects, d_inst_prefix, d_colors, total_pts, colors.size(), num_valid_rects, field_data.size(), d_points);
   KERNEL_CHECK(stream);
+
+  std::cout << "ByField GPU populated points." << std::endl;
 
   // Map colors to their output index to match send output iterator.
   std::map<FT, size_t> color_indices;
@@ -134,6 +146,8 @@ void GPUByFieldMicroOp<N,T,FT>::execute()
   accessors_instance.destroy();
   out_instance.destroy();
   inst_counters_instance.destroy();
+
+  std::cout << "ByField GPU sending off " << total_pts << " points for final processing." << std::endl;
 
   // Ship off the points for final processing.
   size_t out_rects = 0;

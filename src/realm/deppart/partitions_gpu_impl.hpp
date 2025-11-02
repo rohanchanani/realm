@@ -333,6 +333,8 @@ namespace Realm {
 
     CUDA_CHECK(cudaMemsetAsync(counters, 0, (lhs.num_children) * sizeof(uint32_t), stream), stream);
 
+    bool check_space = out_size > 0;
+
     BVH<N, T> my_bvh;
     RegionInstance bvh_instance;
     bool bvh_valid = rhs.num_children > rhs.num_entries;
@@ -362,6 +364,8 @@ namespace Realm {
 
     out_size = h_inst_counters[lhs.num_children];
 
+    std::cout << "out_size : " << out_size << std::endl;
+
     if (out_size==0) {
       if (bvh_valid) {
         bvh_instance.destroy();
@@ -369,7 +373,7 @@ namespace Realm {
       return;
     }
 
-    if (out_size * (sizeof(out_t)+sizeof(size_t)) > avail_space) {
+    if (out_size * (sizeof(out_t)+sizeof(size_t)) > avail_space && check_space) {
       // Not enough space, caller must retry.
       if (bvh_valid) {
           bvh_instance.destroy();
