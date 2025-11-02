@@ -103,6 +103,12 @@ namespace Realm {
   template<typename space_t>
   void GPUMicroOp<N,T>::collapse_multi_space(const std::vector<space_t>& spaces, RegionInstance& out_instance, collapsed_space<N, T> &out_space, Memory my_mem, cudaStream_t stream)
   {
+
+    char *val = std::getenv("SHATTER_SIZE");  // or any env var
+    size_t shatter_size = 1; //default
+    if (val) {
+      shatter_size = atoi(val);
+    }
     // We need space_offsets to preserve which space each rectangle came from
     std::vector<size_t> space_offsets(spaces.size() + 1);
 
@@ -118,7 +124,11 @@ namespace Realm {
         my_space = spaces[i].index_space;
       }
       if (my_space.dense()) {
-        out_space.num_entries += 1;
+        if constexpr (std::is_same_v<space_t, IndexSpace<N,T>>) {
+          out_space.num_entries += 1;
+        } else {
+          out_space.num_entries += shatter_size;
+        }
       } else {
         out_space.num_entries += my_space.sparsity.impl()->get_entries().size();
       }
@@ -129,10 +139,15 @@ namespace Realm {
     Memory sysmem;
     assert(find_memory(sysmem, Memory::SYSTEM_MEM));
 
+
     RegionInstance h_instance = realm_malloc(out_space.num_entries * sizeof(SparsityMapEntry<N,T>), sysmem);
     SparsityMapEntry<N, T>* h_entries = reinterpret_cast<SparsityMapEntry<N,T>*>(AffineAccessor<char,1>(h_instance, 0).base);
 
-    out_instance = realm_malloc(out_space.num_entries * sizeof(SparsityMapEntry<N,T>), my_mem);
+    if (my_mem.kind() == Memory::SYSTEM_MEM) {
+      out_instance = h_instance;
+    } else {
+      out_instance = realm_malloc(out_space.num_entries * sizeof(SparsityMapEntry<N,T>), my_mem);
+    }
     out_space.entries_buffer = reinterpret_cast<SparsityMapEntry<N,T>*>(AffineAccessor<char,1>(out_instance, 0).base);
 
     //Now we fill the host array with all rectangles
@@ -145,10 +160,27 @@ namespace Realm {
         my_space = spaces[i].index_space;
       }
       if (my_space.dense()) {
-        SparsityMapEntry<N,T> entry;
-        entry.bounds = my_space.bounds;
-        memcpy(h_entries + pos, &entry, sizeof(SparsityMapEntry<N,T>));
-        ++pos;
+        if constexpr (std::is_same_v<space_t, IndexSpace<N,T>>) {
+          SparsityMapEntry<N,T> entry;
+          entry.bounds = my_space.bounds;
+          memcpy(h_entries + pos, &entry, sizeof(SparsityMapEntry<N,T>));
+          ++pos;
+        } else {
+          std::vector<SparsityMapEntry<N,T> > tmp(shatter_size);
+          int ppt = (my_space.bounds.hi[0] - my_space.bounds.lo[0]+1) / shatter_size;
+          for (int i = 0; i < shatter_size; ++i) {
+            Rect<N,T> new_rect = my_space.bounds;
+            new_rect.lo[0] = my_space.bounds.lo[0] + i * ppt;
+            new_rect.hi[0] = (i == shatter_size - 1) ? my_space.bounds.hi[0] : (new_rect.lo[0] + ppt - 1);
+            SparsityMapEntry<N,T> entry;
+            entry.bounds = new_rect;
+            entry.sparsity.id = 0;
+            entry.bitmap = 0;
+            tmp[i] = entry;
+          }
+          memcpy(h_entries + pos, tmp.data(), tmp.size() * sizeof(SparsityMapEntry<N,T>));
+          pos += shatter_size;
+        }
       } else {
         span<SparsityMapEntry<N, T>> tmp = my_space.sparsity.impl()->get_entries();
         memcpy(h_entries + pos, tmp.data(), tmp.size() * sizeof(SparsityMapEntry<N,T>));
@@ -157,10 +189,14 @@ namespace Realm {
     }
 
     //Now we copy our entries and offsets to the device
-    CUDA_CHECK(cudaMemcpyAsync(out_space.entries_buffer, h_entries, out_space.num_entries * sizeof(SparsityMapEntry<N,T>), cudaMemcpyHostToDevice, stream), stream);
     CUDA_CHECK(cudaMemcpyAsync(out_space.offsets, space_offsets.data(), (spaces.size() + 1) * sizeof(size_t), cudaMemcpyHostToDevice, stream), stream);
+    if (my_mem.kind() == Memory::GPU_FB_MEM) {
+      CUDA_CHECK(cudaMemcpyAsync(out_space.entries_buffer, h_entries, out_space.num_entries * sizeof(SparsityMapEntry<N,T>), cudaMemcpyHostToDevice, stream), stream);
+      CUDA_CHECK(cudaStreamSynchronize(stream), stream);
+      h_instance.destroy();
+    }
     CUDA_CHECK(cudaStreamSynchronize(stream), stream);
-    h_instance.destroy();
+
   }
 
   // Only real work here is getting dense/sparse into a single collapsed_space.
@@ -304,6 +340,8 @@ namespace Realm {
       build_bvh(rhs, bvh_instance, my_bvh, my_mem, stream);
     }
 
+    size_t avail_space = out_size;
+
     // First pass: figure out how many rectangles survive intersection.
     if (!bvh_valid) {
       intersect_input_rects<N, T, out_t><<<COMPUTE_GRID(lhs.num_entries * rhs.num_entries), THREADS_PER_BLOCK, 0, stream>>>(lhs.entries_buffer, rhs.entries_buffer, lhs.offsets, nullptr, rhs.offsets, lhs.num_entries, rhs.num_entries, lhs.num_children, rhs.num_children, counters, nullptr);
@@ -325,6 +363,18 @@ namespace Realm {
     out_size = h_inst_counters[lhs.num_children];
 
     if (out_size==0) {
+      if (bvh_valid) {
+        bvh_instance.destroy();
+      }
+      return;
+    }
+
+    if (out_size * (sizeof(out_t)+sizeof(size_t)) > avail_space) {
+      // Not enough space, caller must retry.
+      if (bvh_valid) {
+          bvh_instance.destroy();
+      }
+      out_size = std::numeric_limits<size_t>::max();
       return;
     }
 
@@ -472,12 +522,12 @@ namespace Realm {
   */
   template<int N, typename T>
   template<typename Container, typename IndexFn, typename MapFn>
-  void GPUMicroOp<N,T>::complete_rect_pipeline(RectDesc<N, T>* d_rects, size_t total_rects, Memory my_mem, const Container& ctr, IndexFn getIndex, MapFn getMap)
+  void GPUMicroOp<N,T>::complete_rect_pipeline(RectDesc<N, T>* d_rects, size_t total_rects, RegionInstance &out_instance, size_t &out_rects, Memory my_mem, const Container& ctr, IndexFn getIndex, MapFn getMap)
   {
 
     //1D case is much simpler
     if (N==1) {
-      this->complete1d_pipeline(d_rects, total_rects, my_mem, ctr, getIndex, getMap);
+      this->complete1d_pipeline(d_rects, total_rects, out_instance, out_rects, my_mem, ctr, getIndex, getMap);
       return;
     }
     NVTX_DEPPART(complete_rect_pipeline);
@@ -643,6 +693,8 @@ namespace Realm {
     RegionInstance flags_instance = this->realm_malloc(num_corners * total_rects * sizeof(uint8_t), my_mem);
 
     RegionInstance exc_sum_instance = this->realm_malloc(num_corners * total_rects * sizeof(size_t), my_mem);
+
+    size_t per_elem_size = 2*alloc_size_1 + sizeof(uint8_t) + sizeof(size_t);
 
     size_t* d_src_keys_in = reinterpret_cast<size_t*>(AffineAccessor<char,1>(shared_instance, 0).base);
     size_t* d_src_keys_out = reinterpret_cast<size_t*>(AffineAccessor<char,1>(shared_instance, 0).base) + num_corners * total_rects;
@@ -925,6 +977,18 @@ namespace Realm {
         CUDA_CHECK(cudaMemcpyAsync(&last_count, &d_seg_counters[num_segments-1], sizeof(uint32_t), cudaMemcpyDeviceToHost, stream), stream);
         CUDA_CHECK(cudaStreamSynchronize(stream), stream);
         next_round += last_count;
+        if (out_rects > 0 && (next_round + last_count) * per_elem_size > out_rects) {
+          shared_instance.destroy();
+          flags_instance.destroy();
+          exc_sum_instance.destroy();
+          seg_bound_instance.destroy();
+          seg_counters.destroy();
+          seg_counters_out.destroy();
+          corners_instance.destroy();
+          out_rects = std::numeric_limits<size_t>::max();
+          return;
+        }
+
         num_intermediate = next_round;
 
         //In this case we exit out to emit rectangles rather than segments
@@ -1146,9 +1210,13 @@ namespace Realm {
     tmp_instance.destroy();
 
     //And... we're done
-    this->send_output(d_rects_in, num_intermediate, my_mem, ctr, getIndex, getMap);
-
-    rects_out_instance.destroy();
+    if (out_rects > 0) {
+      out_instance = rects_out_instance;
+      out_rects = num_intermediate;
+    } else {
+      this->send_output(d_rects_in, num_intermediate, my_mem, ctr, getIndex, getMap);
+      rects_out_instance.destroy();
+    }
 
   }
 
@@ -1164,7 +1232,7 @@ namespace Realm {
  */
   template<int N, typename T>
   template<typename Container, typename IndexFn, typename MapFn>
-  void GPUMicroOp<N,T>::complete1d_pipeline(RectDesc<N, T>* d_rects, size_t total_rects, Memory my_mem, const Container& ctr, IndexFn getIndex, MapFn getMap)
+  void GPUMicroOp<N,T>::complete1d_pipeline(RectDesc<N, T>* d_rects, size_t total_rects, RegionInstance &out_instance, size_t &out_rects, Memory my_mem, const Container& ctr, IndexFn getIndex, MapFn getMap)
   {
 
     NVTX_DEPPART(complete1d_pipeline);
@@ -1290,9 +1358,13 @@ namespace Realm {
     break_points_instance.destroy();
     group_ids_instance.destroy();
 
-    this->send_output(d_rects_in, num_intermediate, my_mem, ctr, getIndex, getMap);
-
-    rects_out_instance.destroy();
+    if (out_rects > 0) {
+      out_instance = rects_out_instance;
+      out_rects = num_intermediate;
+    } else {
+      this->send_output(d_rects_in, num_intermediate, my_mem, ctr, getIndex, getMap);
+      rects_out_instance.destroy();
+    }
   }
 
    /*
@@ -1306,7 +1378,7 @@ namespace Realm {
   */
   template<int N, typename T>
   template<typename Container, typename IndexFn, typename MapFn>
-  void GPUMicroOp<N,T>::complete_pipeline(PointDesc<N, T>* d_points, size_t total_pts, Memory my_mem, const Container& ctr, IndexFn getIndex, MapFn getMap)
+  void GPUMicroOp<N,T>::complete_pipeline(PointDesc<N, T>* d_points, size_t total_pts, RegionInstance &out_instance, size_t &out_rects, Memory my_mem, const Container& ctr, IndexFn getIndex, MapFn getMap)
   {
 
     NVTX_DEPPART(complete_pipeline);
@@ -1419,9 +1491,18 @@ namespace Realm {
       break_points_instance.destroy();
     }
 
-    this->send_output(d_rects_in, num_intermediate, my_mem, ctr, getIndex, getMap);
-
-    aux_instance.destroy();
+    if (out_rects==1) {
+      RectDesc<N, T>* rects_out = reinterpret_cast<RectDesc<N, T>*>(AffineAccessor<char,1>(aux_instance, 0).base);
+      if (rects_out != d_rects_in) {
+        CUDA_CHECK(cudaMemcpyAsync(rects_out, d_rects_in, num_intermediate * sizeof(RectDesc<N,T>), cudaMemcpyDeviceToDevice, stream), stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream), stream);
+      }
+      out_instance = aux_instance;
+      out_rects = num_intermediate;
+    } else {
+      this->send_output(d_rects_in, num_intermediate, my_mem, ctr, getIndex, getMap);
+      aux_instance.destroy();
+    }
   }
 
   /*

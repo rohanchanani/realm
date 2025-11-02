@@ -3,6 +3,8 @@
 #include "realm/deppart/image_gpu_kernels.hpp"
 #include "realm/deppart/partitions_gpu_impl.hpp"
 #include <cub/cub.cuh>
+#include <thrust/device_ptr.h>
+#include <thrust/transform.h>
 #include "realm/nvtx.h"
 
 namespace Realm {
@@ -190,7 +192,8 @@ void GPUImageMicroOp<N,T,N2,T2>::gpu_populate_rngs()
     src_counters_instance.destroy();
     rngs_instance.destroy();
 
-    this->complete_rect_pipeline(d_valid_intersect, num_valid_output, my_mem,
+    size_t out_rects = 0;
+    this->complete_rect_pipeline(d_valid_intersect, num_valid_output, rngs_instance, out_rects, my_mem,
     /* the Container: */  sparsity_outputs,
     /* getIndex: */       [&](auto const& elem){
                             // elem is a SparsityMap<N,T> from the vector
@@ -225,11 +228,22 @@ void GPUImageMicroOp<N,T,N2,T2>::gpu_populate_ptrs()
 
     Memory my_mem = domain_transform.ptr_data[0].inst.get_location();
 
+    Memory sysmem;
+    find_memory(sysmem, Memory::SYSTEM_MEM);
+
     cudaStream_t stream = Cuda::get_task_cuda_stream();
 
+    const char* val = std::getenv("TILE_SIZE");  // or any env var
+    size_t tile_size = 100; //default
+    if (val) {
+      tile_size = atoi(val);
+    }
+
+    //tile_size *= 1024 * 1024; //convert to number of bytes
+
     collapsed_space<N2, T2> src_space;
-    RegionInstance offsets_instance = this->realm_malloc((sources.size()+1) * sizeof(size_t), my_mem);
-    src_space.offsets = reinterpret_cast<size_t*>(AffineAccessor<char,1>(offsets_instance, 0).base);
+    RegionInstance src_offsets_instance = this->realm_malloc((sources.size()+1) * sizeof(size_t), my_mem);
+    src_space.offsets = reinterpret_cast<size_t*>(AffineAccessor<char,1>(src_offsets_instance, 0).base);
     src_space.num_children = sources.size();
 
     RegionInstance sources_entries_instance;
@@ -243,9 +257,9 @@ void GPUImageMicroOp<N,T,N2,T2>::gpu_populate_ptrs()
     inst_space.offsets = reinterpret_cast<size_t*>(AffineAccessor<char,1>(inst_offsets_instance, 0).base);
     inst_space.num_children = domain_transform.ptr_data.size();
   
-    RegionInstance inst_entries_instance;
+    RegionInstance h_inst_entries;
 
-    GPUMicroOp<N2, T2>::collapse_multi_space(domain_transform.ptr_data, inst_entries_instance, inst_space, my_mem, stream);
+    GPUMicroOp<N2, T2>::collapse_multi_space(domain_transform.ptr_data, h_inst_entries, inst_space, sysmem, stream);
 
     // This is used for count + emit: first pass counts how many rectangles survive intersection, second pass uses the counter
     // to figure out where to write each rectangle.
@@ -256,38 +270,9 @@ void GPUImageMicroOp<N,T,N2,T2>::gpu_populate_ptrs()
     // to track which instance each rectangle came from in the populate phase.
     uint32_t* d_inst_prefix = d_inst_counters + domain_transform.ptr_data.size();
     RegionInstance valid_rects_instance;
-    size_t num_valid_rects;
-  
-    // Here we intersect the instance spaces with the parent space, and make sure we know which instance each resulting rectangle came from.
-    GPUMicroOp<N2, T2>::template construct_input_rectlist<RectDesc<N2, T2>>(inst_space, src_space, valid_rects_instance, num_valid_rects, d_inst_counters, d_inst_prefix, my_mem, stream);
-    inst_entries_instance.destroy();
-    sources_entries_instance.destroy();
-    inst_offsets_instance.destroy();
+    size_t num_valid_rects = tile_size;
 
-    if (num_valid_rects == 0) {
-      for (SparsityMap<N, T> it : sparsity_outputs) {
-            SparsityMapImpl<N, T> *impl = SparsityMapImpl<N, T>::lookup(it);
-            if (this->exclusive) {
-              impl->gpu_finalize();
-            } else {
-              impl->contribute_nothing();
-            }
-      }
-      valid_rects_instance.destroy();
-      inst_counters_instance.destroy();
-      return;
-    }
-
-    RectDesc<N2, T2>* d_valid_rects = reinterpret_cast<RectDesc<N2,T2>*>(AffineAccessor<char,1>(valid_rects_instance, 0).base);
-
-    // Prefix sum the valid rectangles by volume.
-    RegionInstance prefix_rects_instance;
-    size_t total_pts;
-
-    GPUMicroOp<N2, T2>::volume_prefix_sum(d_valid_rects, num_valid_rects, prefix_rects_instance, total_pts, my_mem, stream);
-
-    size_t* d_prefix_rects = reinterpret_cast<size_t*>(AffineAccessor<char,1>(prefix_rects_instance, 0).base);
-
+    //Uniform for all tiles
     RegionInstance parent_entries_instance;
     collapsed_space<N, T> collapsed_parent;
 
@@ -302,24 +287,200 @@ void GPUImageMicroOp<N,T,N2,T2>::gpu_populate_ptrs()
       d_accessors[i] = AffineAccessor<Point<N,T>,N2,T2>(domain_transform.ptr_data[i].inst, domain_transform.ptr_data[i].field_offset);
     }
 
-    CUDA_CHECK(cudaMemsetAsync(d_inst_counters, 0, (domain_transform.ptr_data.size()) * sizeof(uint32_t), stream), stream);
+    RegionInstance prefix_points_instance = this->realm_malloc((domain_transform.ptr_data.size() + 1) * sizeof(uint32_t), my_mem);
+    uint32_t* d_prefix_points = reinterpret_cast<uint32_t *>(AffineAccessor<char,1>(prefix_points_instance, 0).base);
+
+    //Here we iterate over the tiles
+    size_t base = src_space.num_entries * sizeof(SparsityMapEntry<N2,T2>);
+    size_t amt_used = base;
+    size_t num_output = 0;
+    RectDesc<N, T>* output_start = nullptr;
+    RegionInstance output_instance;
+    size_t num_completed = 0;
+    size_t curr_tile = tile_size / 2;
+    int count = 0;
+    while (num_completed < inst_space.num_entries) {
+      std::cout << "Tile iteration " << count++ << ", completed " << num_completed << " / " << inst_space.num_entries << " entries." << std::endl;
+      amt_used = base + num_output * sizeof(RectDesc<N,T>);
+      if (num_completed + curr_tile > inst_space.num_entries) {
+        curr_tile = inst_space.num_entries - num_completed;
+      }
+      collapsed_space<N2, T2> inst_space_tile = inst_space;
+      inst_space_tile.num_entries = curr_tile;
+      RegionInstance inst_tile_instance = this->realm_malloc(curr_tile * sizeof(SparsityMapEntry<N2,T2>), my_mem);
+      inst_space_tile.entries_buffer = reinterpret_cast<SparsityMapEntry<N2,T2>*>(AffineAccessor<char,1>(inst_tile_instance, 0).base);
+      amt_used += curr_tile * sizeof(SparsityMapEntry<N2,T2>);
+      CUDA_CHECK(cudaMemcpyAsync(inst_space_tile.entries_buffer, inst_space.entries_buffer + num_completed, curr_tile * sizeof(SparsityMapEntry<N2,T2>), cudaMemcpyHostToDevice, stream), stream);
+
+      // Here we intersect the instance spaces with the parent space, and make sure we know which instance each resulting rectangle came from.
+      num_valid_rects = tile_size - amt_used;
+      if (num_valid_rects == 0) {
+        curr_tile /= 2;
+        inst_tile_instance.destroy();
+        continue;
+      }
+      GPUMicroOp<N2, T2>::template construct_input_rectlist<RectDesc<N2, T2>>(inst_space_tile, src_space, valid_rects_instance, num_valid_rects, d_inst_counters, d_inst_prefix, my_mem, stream);
+
+      if (num_valid_rects == std::numeric_limits<size_t>::max()) {
+        curr_tile /= 2;
+        inst_tile_instance.destroy();
+        continue;
+      }
+
+      if (num_valid_rects == 0) {
+        inst_tile_instance.destroy();
+        num_completed += curr_tile;
+        curr_tile = tile_size / 2;
+        subtract_const<<<COMPUTE_GRID(domain_transform.ptr_data.size()), THREADS_PER_BLOCK, 0, stream>>>(inst_space.offsets, domain_transform.ptr_data.size()+1, curr_tile);
+        CUDA_CHECK(cudaStreamSynchronize(stream), stream);
+        continue;
+      }
+
+      inst_tile_instance.destroy();
+      amt_used -= curr_tile * sizeof(SparsityMapEntry<N2,T2>);
+      amt_used += num_valid_rects * (sizeof(RectDesc<N2,T2>) + sizeof(size_t));
+
+      RectDesc<N2, T2>* d_valid_rects = reinterpret_cast<RectDesc<N2,T2>*>(AffineAccessor<char,1>(valid_rects_instance, 0).base);
+
+      // Prefix sum the valid rectangles by volume.
+      RegionInstance prefix_rects_instance;
+      size_t total_pts;
+
+      GPUMicroOp<N2, T2>::volume_prefix_sum(d_valid_rects, num_valid_rects, prefix_rects_instance, total_pts, my_mem, stream);
+
+      size_t* d_prefix_rects = reinterpret_cast<size_t*>(AffineAccessor<char,1>(prefix_rects_instance, 0).base);
+
+      CUDA_CHECK(cudaMemsetAsync(d_inst_counters, 0, (domain_transform.ptr_data.size()) * sizeof(uint32_t), stream), stream);
+
+      //We do a two pass count + emit to chase all the pointers in parallel and check for membership in the parent index space
+      image_gpuPopulateBitmasksPtrsKernel<N,T,N2,T2><<<COMPUTE_GRID(total_pts), THREADS_PER_BLOCK, 0, stream>>>(d_accessors, d_valid_rects, collapsed_parent.entries_buffer, d_prefix_rects, d_inst_prefix, nullptr, total_pts, num_valid_rects, domain_transform.ptr_data.size(), collapsed_parent.num_entries, d_inst_counters, nullptr);
+      KERNEL_CHECK(stream);
+
+      std::vector<uint32_t> h_inst_counters(domain_transform.ptr_data.size()+1);
+      h_inst_counters[0] = 0; // prefix sum starts at 0
+      CUDA_CHECK(cudaMemcpyAsync(h_inst_counters.data()+1, d_inst_counters, domain_transform.ptr_data.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost, stream), stream);
+      CUDA_CHECK(cudaStreamSynchronize(stream), stream);
+      for (size_t i = 0; i < domain_transform.ptr_data.size(); ++i) {
+        h_inst_counters[i+1] += h_inst_counters[i];
+      }
+
+      size_t num_valid_points = h_inst_counters[domain_transform.ptr_data.size()];
+
+      if (num_valid_points == 0) {
+        num_completed += curr_tile;
+        curr_tile = tile_size / 2;
+        subtract_const<<<COMPUTE_GRID(domain_transform.ptr_data.size()), THREADS_PER_BLOCK, 0, stream>>>(inst_space.offsets, domain_transform.ptr_data.size()+1, curr_tile);
+        CUDA_CHECK(cudaStreamSynchronize(stream), stream);
+        valid_rects_instance.destroy();
+        prefix_rects_instance.destroy();
+        continue;
+      }
+
+      //Failed
+      if (num_valid_points * sizeof(PointDesc<N,T>) + amt_used > tile_size) {
+        curr_tile /= 2;
+        valid_rects_instance.destroy();
+        prefix_rects_instance.destroy();
+        continue;
+      }
+
+      amt_used += num_valid_points * sizeof(PointDesc<N,T>);
+
+      CUDA_CHECK(cudaMemcpyAsync(d_prefix_points, h_inst_counters.data(), (domain_transform.ptr_data.size() + 1) * sizeof(uint32_t), cudaMemcpyHostToDevice, stream), stream);
+
+      RegionInstance valid_points_instance = this->realm_malloc(num_valid_points * sizeof(PointDesc<N,T>), my_mem);
+      PointDesc<N,T>* d_valid_points = reinterpret_cast<PointDesc<N,T>*>(AffineAccessor<char,1>(valid_points_instance, 0).base);
+
+      CUDA_CHECK(cudaMemsetAsync(d_inst_counters, 0, (domain_transform.ptr_data.size()) * sizeof(uint32_t), stream), stream);
+
+      image_gpuPopulateBitmasksPtrsKernel<N,T,N2,T2><<<COMPUTE_GRID(total_pts), THREADS_PER_BLOCK, 0, stream>>>(d_accessors, d_valid_rects, collapsed_parent.entries_buffer, d_prefix_rects, d_inst_prefix, d_prefix_points, total_pts, num_valid_rects, domain_transform.ptr_data.size(), collapsed_parent.num_entries, d_inst_counters, d_valid_points);
+      KERNEL_CHECK(stream);
+      CUDA_CHECK(cudaStreamSynchronize(stream), stream);
+      valid_rects_instance.destroy();
+      prefix_rects_instance.destroy();
+
+      amt_used -= num_valid_rects * (sizeof(RectDesc<N,T>) + sizeof(size_t));
+
+      RegionInstance new_rects_instance;
+      size_t num_new_rects = 1;
 
 
-    //We do a two pass count + emit to chase all the pointers in parallel and check for membership in the parent index space
-    image_gpuPopulateBitmasksPtrsKernel<N,T,N2,T2><<<COMPUTE_GRID(total_pts), THREADS_PER_BLOCK, 0, stream>>>(d_accessors, d_valid_rects, collapsed_parent.entries_buffer, d_prefix_rects, d_inst_prefix, nullptr, total_pts, num_valid_rects, domain_transform.ptr_data.size(), collapsed_parent.num_entries, d_inst_counters, nullptr);
-    KERNEL_CHECK(stream);
+      //Send it off for processing
+      this->complete_pipeline(d_valid_points, num_valid_points, new_rects_instance, num_new_rects, my_mem,
+      /* the Container: */  sparsity_outputs,
+      /* getIndex: */       [&](auto const& elem){
+                              // elem is a SparsityMap<N,T> from the vector
+                              return size_t(&elem - sparsity_outputs.data());
+                           },
+      /* getMap: */         [&](auto const& elem){
+                            // return the SparsityMap key itself
+                            return elem;
+                         });
 
-    std::vector<uint32_t> h_inst_counters(domain_transform.ptr_data.size()+1);
-    h_inst_counters[0] = 0; // prefix sum starts at 0
-    CUDA_CHECK(cudaMemcpyAsync(h_inst_counters.data()+1, d_inst_counters, domain_transform.ptr_data.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost, stream), stream);
-    CUDA_CHECK(cudaStreamSynchronize(stream), stream);
-    for (size_t i = 0; i < domain_transform.ptr_data.size(); ++i) {
-      h_inst_counters[i+1] += h_inst_counters[i];
+      valid_points_instance.destroy();
+
+      if (num_output == 0) {
+        output_start = reinterpret_cast<RectDesc<N, T>*>(AffineAccessor<char, 1>(new_rects_instance, 0).base);
+        output_instance = new_rects_instance;
+        num_output = num_new_rects;
+        num_completed += curr_tile;
+        subtract_const<<<COMPUTE_GRID(domain_transform.ptr_data.size()), THREADS_PER_BLOCK, 0, stream>>>(inst_space.offsets, domain_transform.ptr_data.size()+1, curr_tile);
+        curr_tile = tile_size / 2;
+        CUDA_CHECK(cudaStreamSynchronize(stream), stream);
+        continue;
+      }
+
+      RectDesc<N, T>* d_new_rects = reinterpret_cast<RectDesc<N, T>*>(AffineAccessor<char, 1>(new_rects_instance, 0).base);
+      RegionInstance new_output_instance = this->realm_malloc((num_output + num_new_rects) * sizeof(RectDesc<N,T>), my_mem);
+      RectDesc<N,T>* d_new_output = reinterpret_cast<RectDesc<N,T>*>(AffineAccessor<char,1>(new_output_instance, 0).base);
+      RectDesc<N, T>* d_old_output = d_new_output + num_new_rects;
+      CUDA_CHECK(cudaMemcpyAsync(d_new_output, d_new_rects, num_new_rects * sizeof(RectDesc<N,T>), cudaMemcpyDeviceToDevice, stream), stream);
+      CUDA_CHECK(cudaMemcpyAsync(d_old_output, output_start, num_output * sizeof(RectDesc<N,T>), cudaMemcpyDeviceToDevice, stream), stream);
+
+      std::vector<RectDesc<N,T>> h_new_rects(num_new_rects);
+      CUDA_CHECK(cudaMemcpyAsync(h_new_rects.data(), d_new_rects, num_new_rects * sizeof(RectDesc<N,T>), cudaMemcpyDeviceToHost, stream), stream);
+      CUDA_CHECK(cudaStreamSynchronize(stream), stream);
+      new_rects_instance.destroy();
+      amt_used = base + (num_output + num_valid_rects) * sizeof(RectDesc<N,T>);
+
+      RegionInstance final_rects_instance;
+      size_t num_final_rects = tile_size - amt_used;
+
+      std::vector<RectDesc<N,T>> h_pre_rects(num_new_rects + num_output);
+      CUDA_CHECK(cudaMemcpyAsync(h_pre_rects.data(), d_new_output, (num_new_rects + num_output) * sizeof(RectDesc<N,T>), cudaMemcpyDeviceToHost, stream), stream);
+
+
+      //Send it off for processing
+      this->complete_rect_pipeline(d_new_output, num_output + num_new_rects, final_rects_instance, num_final_rects, my_mem,
+      /* the Container: */  sparsity_outputs,
+      /* getIndex: */       [&](auto const& elem){
+                              // elem is a SparsityMap<N,T> from the vector
+                              return size_t(&elem - sparsity_outputs.data());
+                           },
+      /* getMap: */         [&](auto const& elem){
+                            // return the SparsityMap key itself
+                            return elem;
+                         });
+
+      if (num_final_rects == std::numeric_limits<size_t>::max()) {
+        new_output_instance.destroy();
+        curr_tile /= 2;
+        continue;
+      }
+      if (num_output > 0) {
+        output_instance.destroy();
+      }
+      new_output_instance.destroy();
+      output_instance = final_rects_instance;
+      output_start = reinterpret_cast<RectDesc<N,T>*>(AffineAccessor<char,1>(output_instance, 0).base);
+      num_completed += curr_tile;
+      num_output = num_final_rects;
+      subtract_const<<<COMPUTE_GRID(domain_transform.ptr_data.size()), THREADS_PER_BLOCK, 0, stream>>>(inst_space.offsets, domain_transform.ptr_data.size()+1, curr_tile);
+      curr_tile = tile_size / 2;
+      CUDA_CHECK(cudaStreamSynchronize(stream), stream);
     }
 
-    size_t num_valid_points = h_inst_counters[domain_transform.ptr_data.size()];
-
-    if (num_valid_points == 0) {
+    if (num_output == 0) {
       for (SparsityMap<N, T> it : sparsity_outputs) {
         SparsityMapImpl<N, T> *impl = SparsityMapImpl<N, T>::lookup(it);
         if (this->exclusive) {
@@ -328,46 +489,17 @@ void GPUImageMicroOp<N,T,N2,T2>::gpu_populate_ptrs()
           impl->contribute_nothing();
         }
       }
-      valid_rects_instance.destroy();
-      prefix_rects_instance.destroy();
-      parent_entries_instance.destroy();
-      accessors_instance.destroy();
-      inst_counters_instance.destroy();
       return;
     }
-
-    RegionInstance prefix_points_instance = this->realm_malloc((domain_transform.ptr_data.size() + 1) * sizeof(uint32_t), my_mem);
-    uint32_t* d_prefix_points = reinterpret_cast<uint32_t *>(AffineAccessor<char,1>(prefix_points_instance, 0).base);
-
-    CUDA_CHECK(cudaMemcpyAsync(d_prefix_points, h_inst_counters.data(), (domain_transform.ptr_data.size() + 1) * sizeof(uint32_t), cudaMemcpyHostToDevice, stream), stream);
-
-    RegionInstance valid_points_instance = this->realm_malloc(num_valid_points * sizeof(PointDesc<N,T>), my_mem);
-    PointDesc<N,T>* d_valid_points = reinterpret_cast<PointDesc<N,T>*>(AffineAccessor<char,1>(valid_points_instance, 0).base);
-
-    CUDA_CHECK(cudaMemsetAsync(d_inst_counters, 0, (domain_transform.ptr_data.size()) * sizeof(uint32_t), stream), stream);
-
-    image_gpuPopulateBitmasksPtrsKernel<N,T,N2,T2><<<COMPUTE_GRID(total_pts), THREADS_PER_BLOCK, 0, stream>>>(d_accessors, d_valid_rects, collapsed_parent.entries_buffer, d_prefix_rects, d_inst_prefix, d_prefix_points, total_pts, num_valid_rects, domain_transform.ptr_data.size(), collapsed_parent.num_entries, d_inst_counters, d_valid_points);
-    KERNEL_CHECK(stream);
-    CUDA_CHECK(cudaStreamSynchronize(stream), stream);
-    valid_rects_instance.destroy();
-    prefix_rects_instance.destroy();
-    parent_entries_instance.destroy();
-    accessors_instance.destroy();
-    inst_counters_instance.destroy();
-    prefix_points_instance.destroy();
-
-    //Send it off for processing
-    this->complete_pipeline(d_valid_points, num_valid_points, my_mem,
-    /* the Container: */  sparsity_outputs,
-    /* getIndex: */       [&](auto const& elem){
-                            // elem is a SparsityMap<N,T> from the vector
-                            return size_t(&elem - sparsity_outputs.data());
-                         },
-    /* getMap: */         [&](auto const& elem){
-                          // return the SparsityMap key itself
-                          return elem;
-                       });
-
-    valid_points_instance.destroy();
+    this->send_output(output_start, num_output, my_mem, sparsity_outputs,
+      /* getIndex: */       [&](auto const& elem){
+                              // elem is a SparsityMap<N,T> from the vector
+                              return size_t(&elem - sparsity_outputs.data());
+                           },
+      /* getMap: */         [&](auto const& elem){
+                            // return the SparsityMap key itself
+                            return elem;
+                         });
+    output_instance.destroy();
 }
 }

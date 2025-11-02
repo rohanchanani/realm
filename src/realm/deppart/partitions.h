@@ -226,13 +226,13 @@ namespace Realm {
     static void volume_prefix_sum(const out_t* d_rects, size_t total_rects, RegionInstance &out_instance, size_t& num_pts, Memory my_mem, cudaStream_t stream);
 
     template<typename Container, typename IndexFn, typename MapFn>
-    void complete_pipeline(PointDesc<N, T>* d_points, size_t total_pts, Memory my_mem, const Container& ctr, IndexFn getIndex, MapFn getMap);
+    void complete_pipeline(PointDesc<N, T>* d_points, size_t total_pts, RegionInstance &out_instance, size_t &out_rects, Memory my_mem, const Container& ctr, IndexFn getIndex, MapFn getMap);
 
     template<typename Container, typename IndexFn, typename MapFn>
-    void complete_rect_pipeline(RectDesc<N, T>* d_rects, size_t total_rects, Memory my_mem, const Container& ctr, IndexFn getIndex, MapFn getMap);
+    void complete_rect_pipeline(RectDesc<N, T>* d_rects, size_t total_rects, RegionInstance &out_instance, size_t &out_rects, Memory my_mem, const Container& ctr, IndexFn getIndex, MapFn getMap);
 
     template<typename Container, typename IndexFn, typename MapFn>
-    void complete1d_pipeline(RectDesc<N, T>* d_rects, size_t total_rects, Memory my_mem, const Container& ctr, IndexFn getIndex, MapFn getMap);
+    void complete1d_pipeline(RectDesc<N, T>* d_rects, size_t total_rects, RegionInstance &out_instance, size_t &out_rects, Memory my_mem, const Container& ctr, IndexFn getIndex, MapFn getMap);
 
     template<typename Container, typename IndexFn, typename MapFn>
     void send_output(RectDesc<N, T>* d_rects, size_t total_rects, Memory my_mem, const Container& ctr, IndexFn getIndex, MapFn getMap);

@@ -70,7 +70,6 @@ void GPUByFieldMicroOp<N,T,FT>::execute()
         impl->contribute_nothing();
       }
     }
-    out_instance.destroy();
     inst_counters_instance.destroy();
     return;
   }
@@ -137,8 +136,8 @@ void GPUByFieldMicroOp<N,T,FT>::execute()
   inst_counters_instance.destroy();
 
   // Ship off the points for final processing.
-
-  this->complete_pipeline(d_points, total_pts, my_mem,
+  size_t out_rects = 0;
+  this->complete_pipeline(d_points, total_pts, out_instance, out_rects, my_mem,
     /* the Container: */  sparsity_outputs,
     /* getIndex: */       [&](auto const& kv){
                             // elem is a SparsityMap<N,T> from the vector

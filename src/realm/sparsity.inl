@@ -89,6 +89,9 @@ namespace Realm {
     if(!entries_valid.load_acquire())
       REALM_ASSERT(0, "get_entries called on sparsity map without valid data");
     if(from_gpu) {
+      if (num_entries == 0) {
+        return span<SparsityMapEntry<N, T>>();
+      }
       return span<SparsityMapEntry<N, T>>(
           reinterpret_cast<SparsityMapEntry<N, T> *>(entries_instance.pointer_untyped(
               0, num_entries * sizeof(SparsityMapEntry<N, T>))),
@@ -103,7 +106,11 @@ namespace Realm {
   {
     if(!approx_valid.load_acquire())
       REALM_ASSERT(0, "get_approx_rects called on sparsity map without valid data");
+
     if(from_gpu) {
+      if (num_approx == 0) {
+        return span<Rect<N, T>>();
+      }
       return span<Rect<N, T>>(
           reinterpret_cast<Rect<N, T> *>(
               approx_instance.pointer_untyped(0, num_approx * sizeof(Rect<N, T>))),

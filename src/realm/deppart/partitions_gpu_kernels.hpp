@@ -16,6 +16,17 @@ __device__ __forceinline__ size_t bsearch(const T* arr, size_t len, T val) {
   return low;
 }
 
+template<typename T>
+__global__ void subtract_const(
+  T* d_data,
+  size_t num_elems,
+  T value
+) {
+  size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= num_elems) return;
+  d_data[idx] = d_data[idx] <= value ? 0 : d_data[idx] - value;
+}
+
 // Intersect all instance rectangles with all parent rectangles in parallel.
 // Used for both count and emit depending on whether the output array is null.
 
@@ -45,7 +56,7 @@ __global__ void intersect_input_rects(
   if (rect_output.empty()) {
     return;
   }
-  size_t lhs_idx = bsearch(d_lhs_offsets, numLHSRects, idx_y);
+  size_t lhs_idx = bsearch(d_lhs_offsets, numLHSChildren, idx_y);
   uint32_t local = atomicAdd(&d_lhs_counters[lhs_idx], 1);
   if (d_rects != nullptr) {
     // If d_rects is not null, we write the output rect
