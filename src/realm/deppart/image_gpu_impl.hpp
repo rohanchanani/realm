@@ -436,18 +436,12 @@ void GPUImageMicroOp<N,T,N2,T2>::gpu_populate_ptrs()
       RectDesc<N, T>* d_old_output = d_new_output + num_new_rects;
       CUDA_CHECK(cudaMemcpyAsync(d_new_output, d_new_rects, num_new_rects * sizeof(RectDesc<N,T>), cudaMemcpyDeviceToDevice, stream), stream);
       CUDA_CHECK(cudaMemcpyAsync(d_old_output, output_start, num_output * sizeof(RectDesc<N,T>), cudaMemcpyDeviceToDevice, stream), stream);
-
-      std::vector<RectDesc<N,T>> h_new_rects(num_new_rects);
-      CUDA_CHECK(cudaMemcpyAsync(h_new_rects.data(), d_new_rects, num_new_rects * sizeof(RectDesc<N,T>), cudaMemcpyDeviceToHost, stream), stream);
       CUDA_CHECK(cudaStreamSynchronize(stream), stream);
       new_rects_instance.destroy();
       amt_used = base + (num_output + num_valid_rects) * sizeof(RectDesc<N,T>);
 
       RegionInstance final_rects_instance;
       size_t num_final_rects = tile_size - amt_used;
-
-      std::vector<RectDesc<N,T>> h_pre_rects(num_new_rects + num_output);
-      CUDA_CHECK(cudaMemcpyAsync(h_pre_rects.data(), d_new_output, (num_new_rects + num_output) * sizeof(RectDesc<N,T>), cudaMemcpyDeviceToHost, stream), stream);
 
 
       //Send it off for processing

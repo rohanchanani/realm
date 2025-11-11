@@ -243,6 +243,8 @@ namespace Realm {
       size_t total_instance_size = indices_instance_size + labels_instance_size + boxes_instance_size + 2 * child_instance_size;
       bvh_instance = realm_malloc(total_instance_size, my_mem);
 
+      result.num_leaves = space.num_entries;
+
       size_t curr_idx = 0;
       result.indices = reinterpret_cast<uint64_t*>(AffineAccessor<char,1>(bvh_instance, 0).base + curr_idx);
       curr_idx += indices_instance_size;
@@ -337,7 +339,7 @@ namespace Realm {
 
     BVH<N, T> my_bvh;
     RegionInstance bvh_instance;
-    bool bvh_valid = rhs.num_children > rhs.num_entries;
+    bool bvh_valid = rhs.num_children < rhs.num_entries;
     if (bvh_valid) {
       build_bvh(rhs, bvh_instance, my_bvh, my_mem, stream);
     }
@@ -363,8 +365,6 @@ namespace Realm {
     }
 
     out_size = h_inst_counters[lhs.num_children];
-
-    std::cout << "out_size : " << out_size << std::endl;
 
     if (out_size==0) {
       if (bvh_valid) {
